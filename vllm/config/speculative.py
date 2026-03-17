@@ -57,6 +57,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
 ]
+RejectionSampleMethod = Literal["strict", "probabilistic"]
 
 
 @config
@@ -171,6 +172,12 @@ class SpeculativeConfig:
     """Load config for the draft model. If not specified, will use the load
     config from the target model."""
 
+    rejection_sample_method: RejectionSampleMethod = "strict"
+    """Whether to use strict (target and draft sampled tokens match exactly)
+    or probabilistic rejection sampling. Both respect the target model
+    distribution, but the latter yields a higher acceptance rate at the cost
+    of more memory to cache draft logits."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -206,7 +213,12 @@ class SpeculativeConfig:
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
-        if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"):
+        # GLM-5 MTP: must be checked BEFORE deepseek fallback
+        if hf_config.model_type == "glm_moe_dsa":
+            hf_config.model_type = "glm4_moe_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["Glm4MoeMTPModel"]})
+        if hf_config.model_type in ("deepseek_v3", "deepseek_v32"):
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "deepseek_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
@@ -779,6 +791,10 @@ class SpeculativeConfig:
             "hunyuan_v1_dense",
             "afmoe",
             "nemotron_h",
+            "deepseek_v2",
+            "deepseek_v3",
+            "kimi_k2",
+            "kimi_k25",
         ]
         if (
             self.method in ("eagle3", "extract_hidden_states")

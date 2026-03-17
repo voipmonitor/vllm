@@ -166,6 +166,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             current_step_idx,
         )
 
+    _logit_call_count = 0
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -225,6 +226,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         )
         return hidden_states
 
+    _logit_call_count = 0
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -297,6 +299,8 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -408,6 +412,8 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         ):
                             continue
 
+                        if name not in params_dict:
+                            continue
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader

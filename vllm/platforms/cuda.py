@@ -52,7 +52,7 @@ def _get_backend_priorities(
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     if use_mla:
-        if device_capability.major == 10:
+        if device_capability.major >= 10:
             # Prefer FlashInfer at low head counts (FlashMLA uses padding)
             if num_heads is not None and num_heads <= 16:
                 sparse_backends = [
@@ -278,10 +278,25 @@ class CudaPlatformBase(Platform):
             f"{config_str}. Reasons: {reasons_str}."
         )
         if len(valid_backends_priorities) == 0:
-            raise ValueError(
-                f"No valid attention backend found for {cls.device_name} "
-                f"with {config_str}. Reasons: {reasons_str}."
-            )
+            # Fallback: retry without sparse if that was the blocker
+            if attn_selector_config.use_sparse:
+                import logging
+                logging.getLogger('vllm.platforms.cuda').warning(
+                    'No sparse MLA backend on this device (cc %s). '
+                    'Falling back to dense MLA.',
+                    device_capability.as_version_str())
+                fb = attn_selector_config._replace(use_sparse=False)
+                valid_backends_priorities, fb_reasons = (
+                    cls.get_valid_backends(
+                        device_capability=device_capability,
+                        attn_selector_config=fb,
+                        num_heads=num_heads))
+                all_invalid_reasons.update(fb_reasons)
+            if len(valid_backends_priorities) == 0:
+                raise ValueError(
+                    f"No valid attention backend found for {cls.device_name} "
+                    f"with {config_str}. Reasons: {reasons_str}."
+                )
 
         # We have found some valid backends. Select the one with the
         # highest priority.

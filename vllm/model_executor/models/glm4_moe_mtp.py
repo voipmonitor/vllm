@@ -117,7 +117,7 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        hidden_states = residual + hidden_states
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -179,7 +179,7 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = self.logits_processor(
-            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+            mtp_layer.shared_head.head, hidden_states
         )
         return logits
 
@@ -285,6 +285,10 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
+                if name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -296,6 +300,8 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
                         continue
                     name = name.replace(weight_name, param_name)
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -325,6 +331,8 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
                     ):
                         continue
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
