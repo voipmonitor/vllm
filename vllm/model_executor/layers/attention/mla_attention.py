@@ -364,6 +364,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         # Initialize KV cache quantization attributes
+        # C++ concat_and_cache_mla only understands "auto" and "fp8" variants;
+        # map bfloat16/float16 to "auto" so the op dispatches correctly.
+        if kv_cache_dtype in ("bfloat16", "float16"):
+            kv_cache_dtype = "auto"
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
@@ -417,7 +421,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         self.kv_cache = torch.tensor([])
 
-        self.use_sparse = use_sparse
+        self.use_sparse = use_sparse and self.attn_backend.is_sparse()
+        if use_sparse and not self.use_sparse:
+            logger.warning_once(
+                "Sparse MLA requested but backend %s is not sparse. "
+                "Falling back to dense attention (all KV attended). "
+                "This may degrade output quality and will reduce "
+                "decode performance for long sequences.",
+                self.attn_backend.get_name(),
+            )
 
         vllm_config = get_current_vllm_config_or_none()
         self.dcp_a2a = (

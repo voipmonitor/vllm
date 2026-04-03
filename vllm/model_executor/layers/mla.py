@@ -108,6 +108,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
         )
 
+        # Sync sparse state: MLAAttention may have disabled sparse
+        # (e.g. backend doesn't support it). Disable indexer accordingly.
+        if self.is_sparse and not self.mla_attn.use_sparse:
+            self.is_sparse = False
+
         self.prefix = prefix
 
     def forward(

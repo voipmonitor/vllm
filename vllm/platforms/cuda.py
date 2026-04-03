@@ -56,7 +56,7 @@ def _get_backend_priorities(
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     if use_mla:
-        if device_capability.major == 10:
+        if device_capability.major >= 10:
             # Sparse MLA backend priorities
             # See https://github.com/vllm-project/vllm/issues/35807 for
             # benchmark results
@@ -265,6 +265,24 @@ class CudaPlatformBase(Platform):
                 )
             except ImportError:
                 invalid_reasons = ["ImportError"]
+            if (
+                invalid_reasons == ["sparse not supported"]
+                and attn_selector_config.use_sparse
+            ):
+                logger.warning_once(
+                    "Selected backend %s does not support sparse. "
+                    "Falling back to dense MLA. This may degrade "
+                    "output quality and will reduce decode "
+                    "performance for long sequences.",
+                    selected_backend,
+                )
+                fallback_config = attn_selector_config._replace(
+                    use_sparse=False
+                )
+                invalid_reasons = backend_class.validate_configuration(
+                    device_capability=device_capability,
+                    **fallback_config._asdict(),
+                )
             if invalid_reasons:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "
@@ -295,10 +313,31 @@ class CudaPlatformBase(Platform):
             f"{config_str}. Reasons: {reasons_str}."
         )
         if len(valid_backends_priorities) == 0:
-            raise ValueError(
-                f"No valid attention backend found for {cls.device_name} "
-                f"with {config_str}. Reasons: {reasons_str}."
-            )
+            if attn_selector_config.use_sparse:
+                logger.warning_once(
+                    "No sparse MLA backend available on this device "
+                    "(compute capability %s). Falling back to dense "
+                    "MLA. This may degrade output quality and will "
+                    "reduce decode performance for long sequences.",
+                    device_capability.as_version_str(),
+                )
+                fallback_config = attn_selector_config._replace(
+                    use_sparse=False
+                )
+                valid_backends_priorities, fb_reasons = (
+                    cls.get_valid_backends(
+                        device_capability=device_capability,
+                        attn_selector_config=fallback_config,
+                        num_heads=num_heads,
+                    )
+                )
+                all_invalid_reasons.update(fb_reasons)
+            if len(valid_backends_priorities) == 0:
+                raise ValueError(
+                    f"No valid attention backend found for "
+                    f"{cls.device_name} "
+                    f"with {config_str}. Reasons: {reasons_str}."
+                )
 
         # We have found some valid backends. Select the one with the
         # highest priority.
