@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Code inside this file can safely assume cuda platform, e.g. importing
 pynvml. However, it should not initialize cuda context.
 """
@@ -322,6 +323,22 @@ class CudaPlatformBase(Platform):
             f"Some attention backends are not valid for {cls.device_name} with "
             f"{config_str}. Reasons: {reasons_str}."
         )
+        if len(valid_backends_priorities) == 0 and attn_selector_config.use_sparse:
+            # No sparse backend available — retry with dense
+            logger.warning_once(
+                "No sparse MLA backend for %s, falling back to dense.",
+                cls.device_name)
+            dense_cfg = attn_selector_config._replace(
+                use_sparse=False)
+            dense_str = dense_cfg.__repr__()
+            valid_backends_priorities, dense_reasons = cls.get_valid_backends(
+                device_capability=device_capability,
+                attn_selector_config=dense_cfg,
+                num_heads=num_heads,
+            )
+            if not valid_backends_priorities:
+                reasons_str += " (dense fallback: " + str(dense_reasons) + ")"
+
         if len(valid_backends_priorities) == 0:
             raise ValueError(
                 f"No valid attention backend found for {cls.device_name} "
