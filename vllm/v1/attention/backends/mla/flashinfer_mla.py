@@ -42,7 +42,7 @@ def _create_wrapper(device, batch_size, tpr=1):
     workspace = torch.zeros(
         FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device=device)
     num_tokens = batch_size * tpr
-    qo_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=device)
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     kv_indices = torch.zeros(batch_size * MAX_PAGES_PER_REQ, dtype=torch.int32, device=device)
     kv_len_arr = torch.zeros(batch_size, dtype=torch.int32, device=device)
