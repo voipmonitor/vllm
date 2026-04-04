@@ -1,0 +1,51 @@
+From 45636366014c18b6a570eab2e7bea8bbc375a03e Mon Sep 17 00:00:00 2001
+From: build <build@docker>
+Date: Sat, 4 Apr 2026 17:46:53 +0000
+Subject: [PATCH] [MoE] Prefer multi-stream shared expert overlap over external
+ ordering
+
+The _determine_shared_experts_order() returned EXTERNAL for TP-only
+configs (no EP/EPLB), preventing aux-stream overlap of shared experts
+with routed experts. This caused 6-8% decode throughput regression.
+
+Reorder checks so MULTI_STREAM_OVERLAPPED takes priority when an aux
+stream is available, matching 0.18.1 behavior.
+---
+ .../layers/fused_moe/runner/shared_experts.py         | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index 6d2189cb4..8ef7041d3 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -110,12 +110,10 @@ class SharedExperts:
+         self,
+         hidden_states: torch.Tensor,
+     ) -> SharedExpertsOrder:
+-        if self._has_external_experts and not self._use_dp_chunking:
+-            return SharedExpertsOrder.EXTERNAL
+-
+         if self._quant_method.mk_owns_shared_expert:
+             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+ 
++        # Prefer multi-stream overlap when aux stream is available
+         should_run_shared_in_aux_stream = (
+             current_platform.is_cuda()
+             and not self._use_dp_chunking
+@@ -126,8 +124,11 @@ class SharedExperts:
+ 
+         if should_run_shared_in_aux_stream:
+             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+-        else:
+-            return SharedExpertsOrder.NO_OVERLAP
++
++        if self._has_external_experts and not self._use_dp_chunking:
++            return SharedExpertsOrder.EXTERNAL
++
++        return SharedExpertsOrder.NO_OVERLAP
+ 
+     def maybe_sync_shared_experts_stream(
+         self,
+-- 
+2.43.0
+
