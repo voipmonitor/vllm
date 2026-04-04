@@ -175,7 +175,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = self.logits_processor(
-            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+            mtp_layer.shared_head.head, hidden_states  # already normed in forward()
         )
         return logits
 
