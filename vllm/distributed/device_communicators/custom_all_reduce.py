@@ -148,7 +148,7 @@ class CustomAllreduce:
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
-        fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        fully_connected = True  # Force True for PCIe P2P support
         if world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
