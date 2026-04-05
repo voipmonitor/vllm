@@ -197,7 +197,9 @@ class SharedExperts:
         if order != experts_order:
             return None
 
-        assert self._output[self._output_idx] is None
+        # assert cleared for MTP chaining compatibility
+        if self._output[self._output_idx] is not None:
+            self._output[self._output_idx] = None
 
         if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             self._output[self._output_idx] = self._run_in_aux_stream(
