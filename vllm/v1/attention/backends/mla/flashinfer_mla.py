@@ -33,10 +33,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
-MAX_PAGES_PER_REQ = 1024
 
 
-def _create_wrapper(device, batch_size, tpr=1):
+def _create_wrapper(device, batch_size, max_pages_per_req, tpr=1):
     """Create a BatchMLAPagedAttentionWrapper with use_cuda_graph=True
     and pre-allocated buffers sized for exactly batch_size requests."""
     workspace = torch.zeros(
@@ -44,7 +43,7 @@ def _create_wrapper(device, batch_size, tpr=1):
     num_tokens = batch_size * tpr
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    kv_indices = torch.zeros(batch_size * MAX_PAGES_PER_REQ, dtype=torch.int32, device=device)
+    kv_indices = torch.zeros(batch_size * max_pages_per_req, dtype=torch.int32, device=device)
     kv_len_arr = torch.zeros(batch_size, dtype=torch.int32, device=device)
     return workspace, BatchMLAPagedAttentionWrapper(
         workspace,
@@ -69,6 +68,9 @@ class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder["FlashInferMLAMetada
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device, **kwargs):
+        max_model_len = vllm_config.model_config.max_model_len
+        block_size = kv_cache_spec.block_size
+        self._max_pages_per_req = (max_model_len + block_size - 1) // block_size
         super().__init__(kv_cache_spec, layer_names, vllm_config, device, supports_dcp_with_varlen=True,
                          metadata_cls=FlashInferMLAMetadata, **kwargs)
 
@@ -89,7 +91,7 @@ class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder["FlashInferMLAMetada
         if key not in self._wrappers:
             logger.info("Creating FlashInfer MLA wrapper for batch=%d tpr=%d",
                         num_reqs, tpr)
-            self._wrappers[key] = _create_wrapper(self._device, num_reqs, tpr)
+            self._wrappers[key] = _create_wrapper(self._device, num_reqs, self._max_pages_per_req, tpr)
         return self._wrappers[key][1]
 
     def _build_decode(self, block_table_tensor, seq_lens_device,
