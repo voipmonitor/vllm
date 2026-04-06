@@ -69,7 +69,7 @@ class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder["FlashInferMLAMetada
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device, **kwargs):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device,
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device, supports_dcp_with_varlen=True,
                          metadata_cls=FlashInferMLAMetadata, **kwargs)
 
         mla_dims = get_mla_dims(self.model_config)
