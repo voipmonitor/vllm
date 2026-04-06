@@ -1733,6 +1733,26 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         return self.build(0, m)
 
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> M:
+        """Build attention metadata for draft model without DCP fields.
+
+        Draft models (MTP layer) have their own local KV cache and don't
+        participate in decode context parallelism. Temporarily disable DCP
+        to prevent incompatible tensor shapes in draft attention kernels.
+        """
+        if self.dcp_world_size > 1:
+            saved = self.dcp_world_size
+            self.dcp_world_size = 1
+            try:
+                return self.build(0, common_attn_metadata, fast_build=True)
+            finally:
+                self.dcp_world_size = saved
+        return self.build(0, common_attn_metadata, fast_build=True)
+
     def build(
         self,
         common_prefix_len: int,
@@ -2752,7 +2772,11 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if has_context:
             assert prefill_metadata.chunked_context is not None
             suffix_output, suffix_lse = output_prefill
-            if self.dcp_world_size > 1:
+            # Check metadata for DCP fields instead of impl.dcp_world_size
+            # because draft models (MTP) build metadata without DCP
+            use_dcp_prefill = (self.dcp_world_size > 1
+                              and prefill_metadata.chunked_context.padded_local_chunk_seq_lens is not None)
+            if use_dcp_prefill:
                 context_output, context_lse = (
                     self._context_parallel_compute_prefill_context(
                         q,

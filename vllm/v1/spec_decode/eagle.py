@@ -1305,6 +1305,14 @@ class SpecDecodeBaseProposer:
             set(all_attn_layers.keys()) - target_attn_layer_names
         )
 
+        # Disable DCP on draft model attention layers.
+        # Draft models (MTP) have their own local KV cache and don't
+        # participate in decode context parallelism.
+        for layer_name in self._draft_attn_layer_names:
+            layer = all_attn_layers[layer_name]
+            if hasattr(layer, 'impl') and hasattr(layer.impl, 'dcp_world_size'):
+                layer.impl.dcp_world_size = 1
+
         if self.supports_mm_inputs:
             # Even if the target model is multimodal, we can also use
             # text-only draft models
