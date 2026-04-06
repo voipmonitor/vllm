@@ -356,23 +356,33 @@ def _b12x_fp4_linear_gemm(
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Dense FP4 GEMM via b12x kernel for SM120 (Blackwell).
+    Dispatches to the custom op registered below.
+    """
+    return torch.ops.vllm.b12x_fp4_linear_gemm(
+        x_fp4, weight, x_blockscale, weight_scale, alpha, output_dtype,
+    )
+
+
+@torch.library.custom_op(
+    "vllm::b12x_fp4_linear_gemm",
+    mutates_args=[],
+    device_types="cuda",
+)
+def _b12x_fp4_linear_gemm_impl(
+    x_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    x_blockscale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dense FP4 GEMM via b12x kernel for SM120 (Blackwell).
 
     Scale factors arrive in vLLM's swizzled 128x4 interleaved layout
     (from swizzle_blockscale / scaled_fp4_quant with is_sf_swizzled_layout=True),
     which is byte-identical to b12x's swizzle_block_scale() output.
     We infer the padded 2D shape from the total element count and reshape
     into the 6D MMA view that b12x expects.
-
-    Args:
-        x_fp4: Packed FP4 activations [M, K//2] (uint8)
-        weight: Packed FP4 weights [N_padded, K//2] (uint8, N already padded to 128)
-        x_blockscale: Swizzled activation scales [M_padded, K_scale_padded] (fp8)
-        weight_scale: Swizzled weight scales [N_padded, K_scale_padded] (fp8)
-        alpha: Global scale factor (fp32 scalar)
-        output_dtype: Desired output dtype (bf16 or fp16)
-
-    Returns:
-        Output tensor [M, N_padded] in output_dtype
     """
     M_orig = x_fp4.shape[0]
     K = x_fp4.shape[1] * 2  # FP4 packed: 2 values per byte
@@ -425,6 +435,20 @@ def _b12x_fp4_linear_gemm(
 
     # Unpad M dimension and squeeze the trailing L=1 dimension
     return out[:M_orig, :, 0]
+
+
+@torch.library.register_fake("vllm::b12x_fp4_linear_gemm")
+def _b12x_fp4_linear_gemm_fake(
+    x_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    x_blockscale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    M = x_fp4.shape[0]
+    N = weight.shape[0]
+    return torch.empty(M, N, dtype=output_dtype, device=x_fp4.device)
 
 
 def swizzle_blockscale(scale: torch.Tensor) -> torch.Tensor:
