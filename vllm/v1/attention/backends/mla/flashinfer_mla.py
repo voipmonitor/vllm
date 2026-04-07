@@ -117,7 +117,7 @@ class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder["FlashInferMLAMetada
         wrapper.plan(
             qo_indptr, kv_indptr, kv_indices,
             seq_lens_device.to(torch.int32),
-            num_heads=self.num_heads,
+            num_heads=self.num_heads * self.dcp_world_size,
             head_dim_ckv=self._kv_lora_rank,
             head_dim_kpe=self._qk_rope_head_dim,
             page_size=page_size, causal=False,
@@ -204,7 +204,7 @@ class FlashInferMLAImpl(MLACommonImpl[FlashInferMLAMetadata]):
         wrapper = attn_metadata.decode.wrapper
         o, lse = wrapper.run(
             q_nope.contiguous(), q_pe.contiguous(),
-            ckv_cache, kpe_cache, return_lse=True)
+            ckv_cache, kpe_cache, return_lse=True, return_lse_base_on_e=True)
 
         v_scale = layer._v_scale_float
         if v_scale != 1.0:
