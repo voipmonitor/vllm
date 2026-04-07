@@ -115,7 +115,8 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             positions=positions, hidden_states=hidden_states, residual=None
         )
         hidden_states = hidden_states + residual
-        hidden_states = self.shared_head.norm(hidden_states)
+        # Return raw (un-normed) hidden states for multi-step chaining.
+        # Norm is applied in compute_logits() before lm_head projection.
         return hidden_states
 
 
@@ -174,8 +175,9 @@ class DeepSeekMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        hidden_states = mtp_layer.shared_head.norm(hidden_states)
         logits = self.logits_processor(
-            mtp_layer.shared_head.head, hidden_states  # already normed in forward()
+            mtp_layer.shared_head.head, hidden_states
         )
         return logits
 
