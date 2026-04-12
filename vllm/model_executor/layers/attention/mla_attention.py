@@ -227,7 +227,6 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
 )
@@ -242,6 +241,7 @@ from vllm.utils.flashinfer import has_flashinfer, has_nvidia_artifactory
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
+    is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -343,7 +343,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
         if (
             self.attn_backend.get_name() == "FLASHMLA_SPARSE"
-            and kv_cache_dtype.startswith("fp8")
+            and is_quantized_kv_cache(kv_cache_dtype)
             and kv_cache_dtype != "fp8_ds_mla"
         ):
             assert cache_config is not None
@@ -357,7 +357,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         if (
             self.attn_backend.get_name() == "FLASHINFER_MLA_SPARSE"
-            and kv_cache_dtype.startswith("fp8")
+            and is_quantized_kv_cache(kv_cache_dtype)
         ):
             logger.info_once(
                 "Using standard fp8 KV cache format. To use DeepSeek's fp8_ds_mla "
@@ -365,9 +365,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         # Initialize KV cache quantization attributes
-        # C++ cache ops only accept 'auto' or fp8. Map others.
-        if kv_cache_dtype in ('bfloat16', 'float16'):
-            kv_cache_dtype = 'auto'
+        # The C++ cache ops only accept "auto" or fp8 variants.
+        # Map non-quantized dtypes to "auto".
+        if kv_cache_dtype in ("bfloat16", "float16"):
+            kv_cache_dtype = "auto"
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
@@ -375,7 +376,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if (
             cache_config is not None
             and cache_config.enable_prefix_caching
-            and vllm_is_batch_invariant()
+            and envs.VLLM_BATCH_INVARIANT
             and (
                 self.attn_backend.get_name() == "TRITON_MLA"
                 or self.attn_backend.get_name() == "FLASHINFER"
@@ -419,12 +420,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        self.kv_cache = [
-            torch.tensor([])
-            for _ in range(
-                get_current_vllm_config().parallel_config.pipeline_parallel_size
-            )
-        ]
+        self.kv_cache = torch.tensor([])
 
         self.use_sparse = use_sparse
 
@@ -457,6 +453,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
         )
+        self._quant_fp8_op = QuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+            compile_native=True,
+        )
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -483,7 +484,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_metadata = forward_context.attn_metadata
             if isinstance(attn_metadata, dict):
                 attn_metadata = attn_metadata[self.layer_name]
-            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+            self_kv_cache = self.kv_cache
             slot_mapping = forward_context.slot_mapping
 
             assert isinstance(slot_mapping, dict), (
@@ -553,9 +554,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError(
-                "fused output quantization is not yet supported for MLA"
+        use_quant = output_scale is not None or output_block_scale is not None
+        if use_quant:
+            # The fusion pass has allocated output with quantized dtype
+            # (FP8 or uint8 for FP4). We can't write into it directly,
+            # so we swap in a temp buffer for computation, then quantize
+            # into the real output at the end.
+            # NOTE(carlyou): this is temporary until kernels support fp8 output
+            quant_output = output
+            output = torch.empty(
+                output.shape[0],
+                self.num_heads * self.v_head_dim,
+                dtype=q.dtype,
+                device=output.device,
             )
 
         if attn_metadata is None:
@@ -575,12 +586,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
             # same expert outputs.
+            if use_quant:
+                return quant_output.fill_(0)
             return output.fill_(0)
 
         if self.impl.dcp_world_size == -1:
             self.impl.dcp_world_size = get_dcp_group().world_size
 
-        fp8_attention = self.kv_cache_dtype.startswith("fp8")
+        fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
 
         num_actual_toks = attn_metadata.num_actual_tokens
 
@@ -714,6 +727,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
+
+        if use_quant:
+            # Quantize the BF16 computation result into the quantized output
+            actual = output[:num_actual_toks]
+            if output_block_scale is not None:
+                # NVFP4: two FP4 values packed into one uint8
+                fp4_data, fp4_scales = ops.scaled_fp4_quant(actual, output_scale)
+                quant_output[:num_actual_toks].copy_(fp4_data)
+                output_block_scale.copy_(fp4_scales)
+            else:
+                # Static FP8 quantization
+                fp8_data, _ = self._quant_fp8_op(actual, output_scale)
+                quant_output[:num_actual_toks].copy_(fp8_data)
+            return quant_output
+
         return output_padded
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
@@ -938,12 +966,14 @@ def unified_mla_kv_cache_update(
     the data dependency between them to ensure torch.compile preserves ordering.
     """
     forward_context = get_forward_context()
-    if forward_context.attn_metadata is None:
-        # Dummy/profile forwards should not update live KV cache pages.
-        return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
-
     attn_layer = forward_context.no_compile_layers[layer_name]
-    kv_cache = attn_layer.kv_cache[forward_context.virtual_engine]
+    kv_cache = attn_layer.kv_cache
+
+    # This needs to run even when we don't have metadata yet, so that the op
+    # is correctly captured.
+    if kv_cache.numel() == 0:
+        # Can't update an empty KV cache.
+        return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
     slot_mapping = forward_context.slot_mapping
     assert isinstance(slot_mapping, dict), (
@@ -1068,6 +1098,10 @@ except ImportError:
                 "MLA models using TRITON_MLA will require flash_attn. "
                 "AITER_MLA backends use aiter kernels instead."
             )
+    elif current_platform.is_xpu():
+        from vllm._xpu_ops import xpu_ops as ops
+
+        flash_attn_varlen_func = ops.flash_attn_varlen_func  # type: ignore[no-redef]
 
 
 def dynamic_per_batched_tensor_quant(
@@ -1184,6 +1218,7 @@ class MLACommonPrefillMetadata:
         padded_local_cu_seq_lens: torch.Tensor | None = None
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
+        prefill_tokens_with_context: int | None = None
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -1385,6 +1420,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     # - VARLEN: Supports variable-length queries (spec decode with mixed lengths)
     # If set to UNIFORM or VARLEN, this will increase `reorder_batch_threshold` when
     # speculative decoding is enabled.
+    supports_update_for_drafting: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
 
     # The threshold for reordering the batch into decode and prefill requests.
@@ -1436,7 +1472,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         is enabled, else model dtype.
         """
         use_fp8 = (
-            vllm_config.cache_config.cache_dtype.startswith("fp8")
+            is_quantized_kv_cache(vllm_config.cache_config.cache_dtype)
             and vllm_config.attention_config.use_prefill_query_quantization
             and backend_supports_prefill_query_quantization()
         )
@@ -1698,6 +1734,83 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         return self.build(0, m)
 
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> M:
+        """Build attention metadata for draft model without DCP fields.
+
+        Draft models (MTP layer) have their own local KV cache and don't
+        participate in decode context parallelism. Temporarily disable DCP
+        to prevent incompatible tensor shapes in draft attention kernels.
+        """
+        if self.dcp_world_size > 1:
+            saved = self.dcp_world_size
+            self.dcp_world_size = 1
+            try:
+                return self.build(0, common_attn_metadata, fast_build=True)
+            finally:
+                self.dcp_world_size = saved
+        return self.build(0, common_attn_metadata, fast_build=True)
+
+    def update_for_drafting(
+        self,
+        attn_metadata: M,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> M:
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        max_seq_len = common_attn_metadata.max_seq_len
+        query_start_loc = common_attn_metadata.query_start_loc
+        seq_lens = common_attn_metadata.seq_lens
+        dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+
+        num_decodes, num_prefills, num_decode_tokens, _ = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+            )
+        )
+
+        if num_prefills > 0:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        dcp_tot_seq_lens_device = None
+        if self.dcp_world_size > 1:
+            dcp_tot_seq_lens_device = seq_lens[:num_decodes]
+            seq_lens = dcp_local_seq_lens
+
+            num_partitions = self.dcp_world_size * self.cp_kv_cache_interleave_size
+            max_seq_len = (
+                (max_seq_len + num_partitions - 1) // num_partitions
+            ) * self.cp_kv_cache_interleave_size
+
+        attn_metadata.num_reqs = num_reqs
+        attn_metadata.max_query_len = common_attn_metadata.max_query_len
+        attn_metadata.max_seq_len = max_seq_len
+        attn_metadata.num_actual_tokens = num_tokens
+        attn_metadata.query_start_loc = query_start_loc
+        attn_metadata.seq_lens = seq_lens
+        attn_metadata.slot_mapping = common_attn_metadata.slot_mapping
+        attn_metadata.num_decodes = num_decodes
+        attn_metadata.num_decode_tokens = num_decode_tokens
+        attn_metadata.num_prefills = num_prefills
+        attn_metadata.num_prefill_tokens = 0
+        attn_metadata.prefill = None
+
+        decode = attn_metadata.decode
+        if decode is None:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        decode.block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+        decode.seq_lens = seq_lens
+        decode.dcp_tot_seq_lens = dcp_tot_seq_lens_device
+
+        return attn_metadata
+
     def build(
         self,
         common_prefix_len: int,
@@ -1745,6 +1858,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
             prefill_query_start_loc = (
                 query_start_loc[reqs_start:] - query_start_loc[reqs_start]
+            )
+            prefill_query_start_loc_cpu = (
+                query_start_loc_cpu[reqs_start:] - query_start_loc_cpu[reqs_start]
             )
 
             chunked_context_metadata = None
@@ -1867,6 +1983,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     if self._use_cudnn_prefill
                     else MLACommonPrefillMetadata.ChunkedContextMetadata
                 )
+                prefill_tokens_with_context = None
+                if num_prefills_with_context_cpu > 0:
+                    prefill_tokens_with_context = prefill_query_start_loc_cpu[
+                        num_prefills_with_context_cpu
+                    ].item()
                 if self.dcp_world_size > 1:
                     chunked_context_metadata = chunked_context_metadata_cls(
                         cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
@@ -1886,6 +2007,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
                     )
                 else:
                     chunked_context_metadata = chunked_context_metadata_cls(
@@ -1899,6 +2021,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         ),
                         chunk_total_token=chunk_total_token,
                         workspace=self.chunked_prefill_workspace,
+                        prefill_tokens_with_context=prefill_tokens_with_context,
                     )
 
                 if self._use_cudnn_prefill:
@@ -2060,6 +2183,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
     understand this class
     """
 
+    def fused_output_quant_supported(self, quant_key):
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8StaticTensorSym,
+            kNvfp4Dynamic,
+        )
+
+        return quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
+
     def __init__(
         self,
         num_heads: int,
@@ -2191,7 +2322,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             # ROCm leverages the upstream flash_attn, which takes a parameter
             # called "return_attn_probs" instead of return_softmax_lse
             kwargs["return_attn_probs"] = return_softmax_lse
-        if vllm_is_batch_invariant():
+        if envs.VLLM_BATCH_INVARIANT:
             kwargs["num_splits"] = 1
 
         attn_out = self.flash_attn_varlen_func(
@@ -2385,14 +2516,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill.chunked_context.seq_lens[chunk_idx] is not None
         assert prefill.workspace_buffer is not None
 
-        out = torch.zeros(
+        out = torch.empty(
             q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
             dtype=prefill.output_dtype,
         )
-        prefill.workspace_buffer.fill_(0)
 
         attn_out, lse = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2505,8 +2635,12 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 if hasattr(self.kv_b_proj, "weight")
                 else self.kv_b_proj.params_dtype
             )
-            if use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype():
-                kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)
+            # For NVFP4, weights are packed uint8 — keep input in model dtype
+            # since the NVFP4 linear layer quantizes internally.
+            if (
+                use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype()
+            ) and _kv_b_proj_w_dtype != torch.uint8:
+                kv_c_normed = kv_c_normed.to(self.kv_b_proj.weight.dtype)
 
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
@@ -2694,8 +2828,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
         if has_context:
+            assert prefill_metadata.chunked_context is not None
             suffix_output, suffix_lse = output_prefill
-            if self.dcp_world_size > 1:
+            # Check metadata for DCP fields instead of impl.dcp_world_size
+            # because draft models (MTP) build metadata without DCP
+            use_dcp_prefill = (self.dcp_world_size > 1
+                              and prefill_metadata.chunked_context.padded_local_chunk_seq_lens is not None)
+            if use_dcp_prefill:
                 context_output, context_lse = (
                     self._context_parallel_compute_prefill_context(
                         q,
@@ -2722,6 +2861,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 prefix_lse=context_lse,
                 suffix_output=suffix_output,
                 suffix_lse=suffix_lse,
+                prefill_tokens_with_context=prefill_metadata.chunked_context.prefill_tokens_with_context,
             )
         else:
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
