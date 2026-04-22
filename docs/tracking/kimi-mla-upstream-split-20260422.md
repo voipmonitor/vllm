@@ -31,6 +31,19 @@ This document is a virtual tracking issue for splitting the current working Dock
 - Integration branch:
   - `sim/integration-kimi-mla-20260422`
 
+## Draft PRs in `voipmonitor/vllm`
+Upstream-candidate simulated PRs:
+- `#3` `[Core] Enable FP8 KV cache with DCP for MLA`
+- `#4` `[SpecDecode] Fix async proposer synchronization`
+- `#5` `[SpecDecode] Allow draft-specific attention backend and KV dtype`
+- `#6` `[SpecDecode] Add local argmax helpers for Qwen3 drafts`
+- `#7` `[SpecDecode] Add local argmax helper for Llama Eagle3`
+
+Local-only simulated PRs:
+- `#8` `[Local] Add seq-length gate for speculative decode`
+- `#9` `[Local] Add PCIe custom allreduce opt-in`
+- `#10` `[Local] Carry current Triton MLA tuning`
+
 ## Existing upstream context
 - `#34795` MLA + DCP + FP8 KV support
 - `#39419` local argmax reduction for large-vocab spec decode
