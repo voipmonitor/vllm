@@ -5,10 +5,12 @@ import ast
 import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-from pydantic import Field, SkipValidation, model_validator
+from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
+from vllm.config.cache import CacheDType
+from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
@@ -16,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -39,6 +42,7 @@ MTPModelTypes = Literal[
     "ernie_mtp",
     "nemotron_h_mtp",
     "exaone_moe_mtp",
+    "exaone4_5_mtp",
     "qwen3_next_mtp",
     "qwen3_5_mtp",
     "longcat_flash_mtp",
@@ -46,8 +50,11 @@ MTPModelTypes = Literal[
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
 ]
-EagleModelTypes = Literal["eagle", "eagle3", "extract_hidden_states", MTPModelTypes]
 NgramGPUTypes = Literal["ngram_gpu"]
+DFlashModelTypes = Literal["dflash"]
+EagleModelTypes = Literal[
+    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+]
 SpeculativeMethod = Literal[
     "ngram",
     "medusa",
@@ -57,6 +64,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
 ]
+RejectionSampleMethod = Literal["strict", "probabilistic", "synthetic"]
 
 
 @config
@@ -66,7 +74,7 @@ class SpeculativeConfig:
     enforce_eager: bool | None = None
     """Override the default enforce_eager from model_config"""
     # General speculative decoding control
-    num_speculative_tokens: int = Field(default=None, gt=0)
+    num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
     number in the draft model config if present, otherwise, it is required."""
     model: str | None = None
@@ -88,10 +96,21 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
-    quantization: me_quant.QuantizationMethods | None = None
+    quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
     takes effect when using the draft model-based speculative method."""
+    moe_backend: MoEBackend | None = None
+    """MoE backend to use for the draft model. When `None`, the draft model
+    inherits the target model's `--moe-backend` setting. Useful when the
+    drafter and generator require different MoE kernels (e.g. quantized
+    generator with unquantized drafter)."""
+    draft_kv_cache_dtype: CacheDType | None = None
+    """KV cache dtype to use for the draft model. When `None`, the draft
+    model inherits the target model's `--kv-cache-dtype` setting."""
+    draft_attention_backend: AttentionBackendEnum | Literal["auto"] | None = None
+    """Attention backend to use for the draft model. When `None`, the draft
+    model inherits the target model's attention backend."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -171,6 +190,28 @@ class SpeculativeConfig:
     """Load config for the draft model. If not specified, will use the load
     config from the target model."""
 
+    rejection_sample_method: RejectionSampleMethod = "strict"
+    """Whether to use strict (target and draft sampled tokens match exactly)
+    or probabilistic rejection sampling. Both respect the target model
+    distribution, but the latter yields a higher acceptance rate at the cost
+    of more memory to cache draft logits."""
+
+    synthetic_acceptance_rate: float | None = None
+    """Average acceptance rate for synthetic rejection sampling. Draft
+    tokens are accepted with a position-dependent probability that decays
+    geometrically, calibrated so that the mean rate across all speculative
+    positions equals this value. Only used when rejection_sample_method
+    is 'synthetic'. Must be in [0, 1]."""
+
+    @field_validator("draft_attention_backend", mode="before")
+    @classmethod
+    def validate_draft_attention_backend_before(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if value.lower() == "auto":
+                return "auto"
+            return AttentionBackendEnum[value.upper()]
+        return value
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -186,7 +227,11 @@ class SpeculativeConfig:
         factors: list[Any] = []
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
-        uses_aux_hidden_states = self.method in ("eagle3", "extract_hidden_states")
+        uses_aux_hidden_states = self.method in (
+            "eagle3",
+            "extract_hidden_states",
+            "dflash",
+        )
         factors.append(uses_aux_hidden_states)
 
         # The specific layers used also affect the computation graph
@@ -272,8 +317,12 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["ErnieMTPModel"]}
             )
 
+        if hf_config.architectures[0] == "NemotronH_Super_Omni_Reasoning_V3":
+            # Promote VLM's text_config so MTP detection below fires correctly
+            hf_config = hf_config.text_config
+
         if (
-            hf_config.model_type == "nemotron_h"
+            hf_config.model_type in {"nemotron_h", "nemotron_h_puzzle"}
             and hasattr(hf_config, "num_nextn_predict_layers")
             and hf_config.num_nextn_predict_layers > 0
         ):
@@ -300,7 +349,13 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["ExaoneMoeMTP"]}
             )
-
+        if "exaone4_5" in hf_config.model_type:
+            hf_config.model_type = "exaone4_5_mtp"
+        if hf_config.model_type == "exaone4_5_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Exaone4_5_MTP"]}
+            )
         if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
             is_moe = hf_config.model_type == "qwen3_5_moe"
             hf_config.model_type = "qwen3_5_mtp"
@@ -470,7 +525,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3"):
+                if self.method in ("eagle", "eagle3", "dflash"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -480,6 +535,8 @@ class SpeculativeConfig:
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
+                elif "dflash" in self.draft_model_config.model.lower():
+                    self.method = "dflash"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -512,9 +569,11 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3"):
-                    from vllm.transformers_utils.configs import SpeculatorsConfig
+                if self.method in ("eagle", "eagle3", "dflash"):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
+                    from vllm.transformers_utils.configs.speculators import (
+                        SpeculatorsConfig,
+                    )
 
                     if isinstance(
                         self.draft_model_config.hf_config,
@@ -529,6 +588,9 @@ class SpeculativeConfig:
                         )
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
+
+                if self.method == "dflash":
+                    self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -779,9 +841,15 @@ class SpeculativeConfig:
             "hunyuan_v1_dense",
             "afmoe",
             "nemotron_h",
+            "deepseek_v2",
+            "deepseek_v3",
+            "kimi_k2",
+            "kimi_k25",
+            "minimax_m2",
+            "gemma4",
         ]
         if (
-            self.method in ("eagle3", "extract_hidden_states")
+            self.method in ("eagle3", "extract_hidden_states", "dflash")
             and self.target_model_config
             and not any(
                 supported_model in self.target_model_config.hf_text_config.model_type
@@ -829,7 +897,10 @@ class SpeculativeConfig:
         return slots_per_req
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+
+    def use_dflash(self) -> bool:
+        return self.method == "dflash"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

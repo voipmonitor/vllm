@@ -37,6 +37,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
@@ -130,7 +131,6 @@ class AfmoeMoE(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=self.route_norm if self.score_func == "sigmoid" else False,
             quant_config=quant_config,
             use_grouped_topk=True,
@@ -151,19 +151,9 @@ class AfmoeMoE(nn.Module):
 
         router_logits = self.gate(hidden_states.to(dtype=torch.float32))
 
-        fused_moe_out = self.experts(
+        final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-
-        if self.shared_experts is not None:
-            shared_output, final_hidden_states = fused_moe_out
-            final_hidden_states = final_hidden_states + shared_output
-        else:
-            final_hidden_states = fused_moe_out
-        if self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
-                final_hidden_states
-            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -384,7 +374,7 @@ class AfmoeDecoderLayer(nn.Module):
         "inputs_embeds": 0,
     }
 )
-class AfmoeModel(nn.Module):
+class AfmoeModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -421,8 +411,6 @@ class AfmoeModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.aux_hidden_state_layers = tuple[int, ...]()
-
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -453,15 +441,14 @@ class AfmoeModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
             hidden_states, residual = layer(positions, hidden_states, residual)
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -690,13 +677,6 @@ class AfmoeForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
-
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
-
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
 
     def forward(
         self,
