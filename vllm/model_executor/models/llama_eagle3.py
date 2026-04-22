@@ -150,6 +150,7 @@ class LlamaModel(nn.Module):
             self.use_aux_hidden_state = eagle_config["use_aux_hidden_state"]
         else:
             self.use_aux_hidden_state = True
+        self.norm_before_fc = getattr(self.config, "norm_before_fc", False)
 
         current_vllm_config = get_current_vllm_config()
 
@@ -175,6 +176,13 @@ class LlamaModel(nn.Module):
                 fc_input_size = self.config.target_hidden_size * 3
             else:
                 fc_input_size = self.config.hidden_size * 3
+            if self.norm_before_fc:
+                self.input_norm = RMSNorm(
+                    fc_input_size,
+                    eps=self.config.rms_norm_eps,
+                )
+            else:
+                self.input_norm = None
             self.fc = ReplicatedLinear(
                 input_size=fc_input_size,
                 output_size=self.config.hidden_size,
@@ -286,6 +294,7 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         self.lm_head = ParallelLMHead(
             self.config.draft_vocab_size,
             self.config.hidden_size,
+            quant_config=get_draft_quant_config(vllm_config),
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(
@@ -295,6 +304,7 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
             requires_grad=False,
         )
+        self._has_identity_draft_vocab_mapping = True
 
         self.use_parallel_drafting = vllm_config.speculative_config.parallel_drafting
 
@@ -325,6 +335,15 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without gathering full logits when possible."""
+        if not self._has_identity_draft_vocab_mapping:
+            return self.compute_logits(hidden_states).argmax(dim=-1)
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def compute_logits(
         self,
@@ -357,6 +376,9 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         if not self.model.use_aux_hidden_state:
             return hidden_states
         # combine multiple auxiliary hidden states returned by eagle3
+
+        if self.model.norm_before_fc:
+            hidden_states = self.model.input_norm(hidden_states)
         return self.model.fc(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -403,9 +425,17 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             skip_substrs.append("embed_tokens")
         if not self.model.use_aux_hidden_state:
             skip_substrs.append("fc.")
+        if not self.model.norm_before_fc:
+            skip_substrs.append("input_norm.")
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=None,
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
+        if includes_draft_id_mapping:
+            self._has_identity_draft_vocab_mapping = bool(
+                not torch.count_nonzero(self.draft_id_to_target_id).item()
+            )
+        else:
+            self._has_identity_draft_vocab_mapping = True
