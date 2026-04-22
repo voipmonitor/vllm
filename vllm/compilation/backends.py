@@ -20,6 +20,7 @@ import torch
 import torch.fx as fx
 from torch._dynamo.utils import dynamo_timed
 from torch._logging._internal import trace_structured
+from torch.fx._lazy_graph_module import _use_lazy_graph_module
 
 import vllm.envs as envs
 from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
@@ -30,6 +31,7 @@ from vllm.logging_utils import lazy
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, instrument_manual
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 from .compiler_interface import (
     CompilerInterface,
@@ -263,6 +265,7 @@ class CompilerManager:
         compile_range: Range,
         graph_index: int = 0,
         num_graphs: int = 1,
+        is_encoder: bool = False,
     ) -> Any:
         if graph_index == 0:
             # before compiling the first graph, record the start time
@@ -280,7 +283,10 @@ class CompilerManager:
                 # after loading the last graph for this shape, record the time.
                 # there can be multiple graphs due to piecewise compilation.
                 elapsed = time.perf_counter() - compilation_start_time
-                compilation_config.compilation_time += elapsed
+                if is_encoder:
+                    compilation_config.encoder_compilation_time += elapsed
+                else:
+                    compilation_config.compilation_time += elapsed
                 logger.info_once(
                     "Directly load the compiled graph(s) for compile range %s "
                     "from the cache, took %.3f s",
@@ -371,19 +377,24 @@ class CompilerManager:
                 logger.info_once(
                     "Cache the graph of compile range %s for later use",
                     str(compile_range),
+                    scope="local",
                 )
-            logger.debug(
+            logger.debug_once(
                 "Store the %s-th graph for compile range%s from %s via handle %s",
                 graph_index,
                 str(compile_range),
                 self.compiler.name,
                 handle,
+                scope="local",
             )
 
         # after compiling the last graph, record the end time
         if graph_index == num_graphs - 1:
             elapsed = time.perf_counter() - compilation_start_time
-            compilation_config.compilation_time += elapsed
+            if is_encoder:
+                compilation_config.encoder_compilation_time += elapsed
+            else:
+                compilation_config.compilation_time += elapsed
             logger.info_once(
                 "Compiling a graph for compile range %s takes %.2f s",
                 str(compile_range),
@@ -431,6 +442,7 @@ def _is_empty_allocation_node(node: fx.Node) -> bool:
 
 def _merge_empty_only_subgraphs(
     node_to_subgraph_id: dict[fx.Node, int],
+    split_op_graphs: list[int],
 ) -> None:
     """
     Merge a partition that only contains an empty allocation op into the
@@ -439,28 +451,111 @@ def _merge_empty_only_subgraphs(
     """
 
     nodes_by_subgraph_id: dict[int, list[fx.Node]] = defaultdict(list)
-    subgraph_id_order: list[int] = []
     for node, subgraph_id in node_to_subgraph_id.items():
-        if subgraph_id not in nodes_by_subgraph_id:
-            subgraph_id_order.append(subgraph_id)
         nodes_by_subgraph_id[subgraph_id].append(node)
 
-    prev_subgraph_id: int | None = None
-    for subgraph_id in subgraph_id_order:
-        nodes = nodes_by_subgraph_id[subgraph_id]
-        if (
-            len(nodes) == 1
-            and _is_empty_allocation_node(nodes[0])
-            and prev_subgraph_id is not None
-        ):
-            node_to_subgraph_id[nodes[0]] = prev_subgraph_id
+    splitting_subgraphs = set(split_op_graphs)
+    prev_non_splitting_subgraph_id: int | None = None
+
+    max_subgraph_id = max(node_to_subgraph_id.values(), default=-1)
+    for subgraph_id in range(max_subgraph_id + 1):
+        nodes = nodes_by_subgraph_id.get(subgraph_id, [])
+        if not nodes:
             continue
-        prev_subgraph_id = subgraph_id
+
+        is_non_splitting_subgraph = subgraph_id not in splitting_subgraphs
+        is_empty_only_subgraph = len(nodes) == 1 and _is_empty_allocation_node(nodes[0])
+        merged = False
+
+        if is_empty_only_subgraph and prev_non_splitting_subgraph_id is not None:
+            # Safety check: don't move allocation before any input producer.
+            empty_node = nodes[0]
+            if all(
+                input_node.op == "placeholder"
+                or node_to_subgraph_id[input_node] <= prev_non_splitting_subgraph_id
+                for input_node in empty_node.all_input_nodes
+            ):
+                node_to_subgraph_id[empty_node] = prev_non_splitting_subgraph_id
+                merged = True
+
+        if not merged and is_non_splitting_subgraph:
+            prev_non_splitting_subgraph_id = subgraph_id
+
+
+def _decompose_size_nodes(graph: fx.GraphModule) -> None:
+    """Decompose x.size() into per-dim sym_size.int calls.
+
+    torch.Size objects cannot cross split boundaries because aot_autograd
+    cannot handle them as submodule outputs. This replaces each size() call
+    with individual sym_size.int(x, dim) nodes:
+      - Dynamic dims (SymInt) → new sym_size.int node
+      - Static dims (plain int) → inlined as literal constant
+    """
+    # Dynamo captures x.size()/x.shape as call_method target="size".
+    size_nodes = list(graph.graph.find_nodes(op="call_method", target="size"))
+
+    for node in size_nodes:
+        tensor_node = node.args[0]
+        ev = tensor_node.meta.get("example_value")
+        assert ev is not None, (
+            f"Tensor node '{tensor_node.name}' has no example_value metadata. "
+            f"Cannot decompose size node '{node.name}'."
+        )
+
+        # Build per-dim replacements: sym_size.int node or literal int.
+        dims: list[fx.Node | int] = []
+        with graph.graph.inserting_after(tensor_node):
+            for i in range(ev.dim()):
+                dim_val = ev.shape[i]
+                if isinstance(dim_val, torch.SymInt):
+                    dn = graph.graph.call_function(
+                        torch.ops.aten.sym_size.int, args=(tensor_node, i)
+                    )
+                    dn.meta["example_value"] = dim_val
+                    dims.append(dn)
+                elif isinstance(dim_val, int):
+                    dims.append(dim_val)
+                else:
+                    raise AssertionError(
+                        f"dim_val is either torch.SymInt or int, "
+                        f"got {type(dim_val)} for dim {i} of "
+                        f"'{node.name}'"
+                    )
+
+        # Replace size node in each user's args.
+        for user in list(node.users):
+            if (
+                user.op == "call_function"
+                and user.target is operator.getitem
+                and len(user.args) == 2
+                and user.args[0] is node
+            ):
+                # getitem(size, idx) → replace with dims[idx] directly.
+                idx = user.args[1]
+                assert isinstance(idx, int), (
+                    f"Expected literal int index for getitem on size(), "
+                    f"got {type(idx).__name__}: {idx}"
+                )
+                user.replace_all_uses_with(dims[idx])
+                graph.graph.erase_node(user)
+            else:
+                # User consumes the full size tuple (e.g. view(clone, size))
+                # → view(clone, d0, d1, ...)
+                new_args = []
+                for arg in user.args:
+                    if arg is node:
+                        new_args.extend(dims)
+                    else:
+                        new_args.append(arg)
+                user.args = tuple(new_args)
+        graph.graph.erase_node(node)
 
 
 def split_graph(
     graph: fx.GraphModule, splitting_ops: list[str]
 ) -> tuple[fx.GraphModule, list[SplitItem]]:
+    _decompose_size_nodes(graph)
+
     # split graph by ops
     subgraph_id = 0
     node_to_subgraph_id: dict[fx.Node, int] = {}
@@ -496,15 +591,22 @@ def split_graph(
         else:
             node_to_subgraph_id[node] = subgraph_id
 
-    _merge_empty_only_subgraphs(node_to_subgraph_id)
+    _merge_empty_only_subgraphs(node_to_subgraph_id, split_op_graphs)
 
     # `keep_original_order` is important!
     # otherwise pytorch might reorder the nodes and
     # the semantics of the graph will change when we
     # have mutations in the graph
-    split_gm = torch.fx.passes.split_module.split_module(
-        graph, None, lambda node: node_to_subgraph_id[node], keep_original_order=True
-    )
+    with _use_lazy_graph_module(True):
+        has_tuple_return = is_torch_equal_or_newer("2.12.0.dev")
+        tuple_return_kwarg = {"tuple_return": True} if has_tuple_return else {}
+        split_gm = torch.fx.passes.split_module.split_module(
+            graph,
+            None,
+            lambda node: node_to_subgraph_id[node],
+            keep_original_order=True,
+            **tuple_return_kwarg,
+        )
 
     outputs = []
 
@@ -922,11 +1024,11 @@ class VllmBackend:
         )
         hash_content = []
         for filepath in forward_code_files:
-            hash_content.append(filepath)
             if filepath == "<string>":
                 # This means the function was dynamically generated, with
                 # e.g. exec(). We can't actually check these.
                 continue
+            hash_content.append(filepath)
             try:
                 with open(filepath) as f:
                     hash_content.append(f.read())
@@ -1035,7 +1137,10 @@ class VllmBackend:
         logger.info_once(
             "Dynamo bytecode transform time: %.2f s", dynamo_time, scope="local"
         )
-        self.compilation_config.compilation_time += dynamo_time
+        if self.is_encoder:
+            self.compilation_config.encoder_compilation_time += dynamo_time
+        else:
+            self.compilation_config.compilation_time += dynamo_time
 
         # Record Dynamo time in tracing if available
         start_time = int(torch_compile_start_time * 1e9)
@@ -1158,6 +1263,23 @@ class VllmBackend:
             original_split_gm if envs.VLLM_USE_MEGA_AOT_ARTIFACT else self.graph
         )
 
+        from vllm.compilation.codegen import (
+            compile_execution_fn,
+            generate_execution_code,
+        )
+
+        execution_code, submod_names = generate_execution_code(self.split_gm)
+        # Use getattr to get correct callables: __dict__ has PiecewiseBackend
+        # instances (from PiecewiseCompileInterpreter), _modules has originals.
+        # getattr checks __dict__ first, then falls back to _modules.
+        submod_callables = {
+            name: getattr(self.split_gm, name)
+            for name, _ in self.split_gm.named_children()
+        }
+        runtime_callable = compile_execution_fn(
+            execution_code, submod_callables, submod_names
+        )
+
         if (
             self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
             or not self.compilation_config.cudagraph_copy_inputs
@@ -1166,9 +1288,11 @@ class VllmBackend:
                 graph_to_serialize,
                 example_inputs,
                 self.prefix,
-                self.split_gm,
+                runtime_callable,
                 is_encoder=self.is_encoder,
                 vllm_backend=self,
+                execution_code=execution_code,
+                submod_names=submod_names,
             )
 
         # index of tensors that have symbolic shapes (batch size)
@@ -1189,7 +1313,7 @@ class VllmBackend:
         copy_and_call = make_copy_and_call(
             sym_tensor_indices,
             [example_inputs[x].clone() for x in sym_tensor_indices],
-            self.split_gm,
+            runtime_callable,
         )
 
         return VllmSerializableFunction(
@@ -1200,4 +1324,6 @@ class VllmBackend:
             is_encoder=self.is_encoder,
             vllm_backend=self,
             sym_tensor_indices=sym_tensor_indices,
+            execution_code=execution_code,
+            submod_names=submod_names,
         )

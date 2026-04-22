@@ -17,7 +17,6 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import cuda_device_count_stateless
 
 try:
     ops.meta_size()
@@ -135,7 +134,7 @@ class CustomAllreduce:
         if cuda_visible_devices:
             device_ids = list(map(int, cuda_visible_devices.split(",")))
         else:
-            device_ids = list(range(cuda_device_count_stateless()))
+            device_ids = list(range(current_platform.device_count()))
 
         physical_device_id = device_ids[device.index]
         tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
@@ -151,12 +150,23 @@ class CustomAllreduce:
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+            import os
+            if os.environ.get("VLLM_ENABLE_PCIE_ALLREDUCE", "0") != "1":
+                logger.warning(
+                    "Custom allreduce is disabled for >2 PCIe-only GPUs. "
+                    "Set VLLM_ENABLE_PCIE_ALLREDUCE=1 to enable P2P custom "
+                    "allreduce on PCIe topology (requires P2P-capable driver, "
+                    "see PR #39040 for details)."
+                )
+                return
+            logger.info(
+                "PCIe custom allreduce enabled via VLLM_ENABLE_PCIE_ALLREDUCE=1"
             )
-            return
+            # Preserve the historical runtime contract used by the working
+            # GLM hotfix: once the operator is explicitly enabled on a PCIe
+            # topology, treat it as eligible for the same small-tensor custom
+            # allreduce path as a fully connected topology.
+            fully_connected = True
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -239,8 +249,9 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
+        # Keep the runtime guard aligned with the initialization contract
+        # above. For >2 PCIe GPUs we only use custom allreduce when the
+        # topology is explicitly opted in and treated as fully connected.
         if self.world_size == 2 or self.fully_connected:
             return inp_size < self.max_size
         return False
