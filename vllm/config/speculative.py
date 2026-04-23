@@ -5,10 +5,11 @@ import ast
 import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-from pydantic import Field, SkipValidation, model_validator
+from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
+from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -17,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -103,6 +105,23 @@ class SpeculativeConfig:
     inherits the target model's `--moe-backend` setting. Useful when the
     drafter and generator require different MoE kernels (e.g. quantized
     generator with unquantized drafter)."""
+    draft_kv_cache_dtype: CacheDType | None = None
+    """KV cache dtype to use for the draft model. When `None`, the draft
+    model inherits the target model's `--kv-cache-dtype` setting. Useful when
+    the generator needs quantized KV cache but the draft backend requires a
+    wider dtype such as bfloat16."""
+    draft_attention_backend: AttentionBackendEnum | Literal["auto"] | None = None
+    """Attention backend to use for the draft model. When `None`, the draft
+    model inherits the target model's attention backend. Useful when the
+    generator and drafter require different kernels (e.g. target MLA with
+    TRITON_MLA and a non-MLA draft model with FLASH_ATTN)."""
+    dflash_draft_window_size: int | None = Field(default=None, ge=1)
+    """Optional sliding-window size for DFlash draft attention.
+
+    When set, the DFlash drafter uses a bounded local attention window
+    instead of attending over the full committed draft history. This is
+    analogous to SGLang's ``--speculative-dflash-draft-window-size``.
+    """
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -195,6 +214,20 @@ class SpeculativeConfig:
     positions equals this value. Only used when rejection_sample_method
     is 'synthetic'. Must be in [0, 1]."""
 
+    @field_validator("draft_attention_backend", mode="before")
+    @classmethod
+    def validate_draft_attention_backend_before(cls, value: Any) -> Any:
+        """Enable parsing of the draft backend enum type from string.
+
+        The special value "auto" is preserved so the draft model can
+        explicitly request automatic backend selection.
+        """
+        if isinstance(value, str):
+            if value.lower() == "auto":
+                return "auto"
+            return AttentionBackendEnum[value.upper()]
+        return value
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -227,6 +260,9 @@ class SpeculativeConfig:
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
+
+        if self.method == "dflash":
+            factors.append(self.dflash_draft_window_size)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str

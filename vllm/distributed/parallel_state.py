@@ -123,6 +123,20 @@ def _get_unique_name(name: str) -> str:
 _groups: dict[str, Callable[[], "GroupCoordinator | None"]] = {}
 
 
+@contextmanager
+def _without_nccl_graph_file(disable: bool):
+    if not disable:
+        yield
+        return
+    import os
+    old = os.environ.pop("NCCL_GRAPH_FILE", None)
+    try:
+        yield
+    finally:
+        if old is not None:
+            os.environ["NCCL_GRAPH_FILE"] = old
+
+
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
@@ -1597,13 +1611,19 @@ def initialize_model_parallel(
             -1, decode_context_model_parallel_size
         ).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
-    _DCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=True,
-        group_name="dcp",
+    disable_graph_for_dcp = (
+        bool(__import__("os").getenv("NCCL_GRAPH_FILE"))
+        and decode_context_model_parallel_size > 1
+        and decode_context_model_parallel_size < tensor_model_parallel_size
     )
+    with _without_nccl_graph_file(disable_graph_for_dcp):
+        _DCP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="dcp",
+        )
 
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"

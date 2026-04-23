@@ -51,6 +51,14 @@ class AttentionConfig:
     use_prefill_query_quantization: bool = False
     """If set, quantize query for attention in prefill."""
 
+    use_non_causal: bool = False
+    """Require attention backends that support non-causal attention.
+
+    This is primarily useful for DFlash draft models, which use
+    bidirectional attention in the drafter while the target model can
+    remain causal.
+    """
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs

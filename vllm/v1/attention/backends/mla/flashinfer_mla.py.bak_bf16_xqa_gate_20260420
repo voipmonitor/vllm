@@ -1,0 +1,588 @@
+# SPDX-License-Identifier: Apache-2.0
+# FlashInfer MLA backend - plan() in builder, run() in forward (SGLang pattern)
+# CG support: UNIFORM_BATCH — per-batch-size wrappers with use_cuda_graph=True
+# ensure plan() copies into fixed-address buffers for safe CUDA graph replay.
+
+from dataclasses import dataclass
+from typing import ClassVar, Optional
+
+import torch
+from flashinfer import BatchMLAPagedAttentionWrapper
+from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+from vllm.config import VllmConfig
+from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonBackend,
+    MLACommonDecodeMetadata,
+    MLACommonImpl,
+    MLACommonMetadata,
+    MLACommonMetadataBuilder,
+    QueryLenSupport,
+    get_mla_dims,
+)
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    AttentionLayer,
+    AttentionType,
+    CommonAttentionMetadata,
+    MultipleOf,
+)
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    split_decodes_and_prefills,
+    KVCacheLayoutType,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec
+
+logger = init_logger(__name__)
+
+FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+
+
+_shared_workspaces: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_shared_workspace(device: torch.device) -> torch.Tensor:
+    workspace = _shared_workspaces.get(device)
+    if workspace is None:
+        workspace = torch.zeros(
+            FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE,
+            dtype=torch.uint8,
+            device=device,
+        )
+        _shared_workspaces[device] = workspace
+    return workspace
+
+
+def _create_wrapper(workspace, device, batch_size, max_pages_per_req, tpr=1):
+    """Create a BatchMLAPagedAttentionWrapper with use_cuda_graph=True
+    and pre-allocated buffers sized for exactly batch_size requests."""
+    num_tokens = batch_size * tpr
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    kv_indices = torch.zeros(
+        batch_size * max_pages_per_req,
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_len_arr = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    return BatchMLAPagedAttentionWrapper(
+        workspace,
+        use_cuda_graph=True,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_len_arr=kv_len_arr,
+        backend="auto",
+    )
+
+
+@dataclass
+class FlashInferMLADecodeMetadata(MLACommonDecodeMetadata):
+    wrapper: Optional[BatchMLAPagedAttentionWrapper] = None
+
+
+class FlashInferMLAMetadataBuilder(MLACommonMetadataBuilder["FlashInferMLAMetadata"]):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_BATCH
+    )
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        speculative_config = vllm_config.speculative_config
+        speculative_tokens = (
+            speculative_config.num_speculative_tokens
+            if speculative_config is not None
+            else 0
+        )
+        if (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+            and speculative_tokens
+        ):
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        return cls._cudagraph_support
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device, **kwargs):
+        max_model_len = vllm_config.model_config.max_model_len
+        block_size = kv_cache_spec.block_size
+        self._max_pages_per_req = (max_model_len + block_size - 1) // block_size
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            supports_dcp_with_varlen=True,
+            metadata_cls=FlashInferMLAMetadata,
+            **kwargs,
+        )
+
+        mla_dims = get_mla_dims(self.model_config)
+        self._kv_lora_rank = mla_dims.kv_lora_rank
+        self._qk_nope_head_dim = mla_dims.qk_nope_head_dim
+        self._qk_rope_head_dim = mla_dims.qk_rope_head_dim
+        self._page_size = kv_cache_spec.block_size
+        self._device = device
+        self._shared_workspace = _get_shared_workspace(device)
+        self._is_fp8_kv_cache = is_quantized_kv_cache(
+            vllm_config.cache_config.cache_dtype
+        )
+        self._q_data_type = self.model_config.dtype
+        self._kv_data_type = (
+            current_platform.fp8_dtype()
+            if self._is_fp8_kv_cache
+            else self.model_config.dtype
+        )
+
+        # Per-batch-size wrappers: created lazily on first use.
+        # Key = (num_reqs, tokens_per_req), value = wrapper.
+        # Wrappers can share the same workspace buffer because planning/runs
+        # happen sequentially within a worker process.
+        self._wrappers: dict[tuple[int, int], BatchMLAPagedAttentionWrapper] = {}
+
+    def _get_wrapper(self, num_reqs, tpr=1):
+        """Get or create a wrapper for the given batch size."""
+        key = (num_reqs, tpr)
+        if key not in self._wrappers:
+            logger.info(
+                "Creating FlashInfer MLA wrapper for batch=%d tpr=%d",
+                num_reqs,
+                tpr,
+            )
+            self._wrappers[key] = _create_wrapper(
+                self._shared_workspace,
+                self._device,
+                num_reqs,
+                self._max_pages_per_req,
+                tpr,
+            )
+        return self._wrappers[key]
+
+    def _build_decode(
+        self,
+        block_table_tensor,
+        seq_lens_device,
+        max_seq_len,
+        query_start_loc_cpu,
+        query_start_loc_device,
+        num_decode_tokens,
+        dcp_tot_seq_lens_device=None,
+    ):
+        page_size = self._page_size
+        dev = seq_lens_device.device
+
+        query_lens_device = (
+            query_start_loc_device[1:] - query_start_loc_device[:-1]
+        ).to(torch.int32)
+        num_reqs = seq_lens_device.shape[0]
+        tpr = num_decode_tokens // num_reqs if num_reqs > 0 else 1
+
+        if num_decode_tokens > num_reqs and (
+            self._is_fp8_kv_cache
+            or (
+                self.dcp_world_size > 1
+                and dcp_tot_seq_lens_device is not None
+            )
+        ):
+            # FlashInfer MLA's FP8 decode path on SM120 only has a viable
+            # single-token backend (XQA), and DCP validation already needs the
+            # same per-token local-seq-len semantics. Flatten the validation
+            # span into independent single-token decode entries.
+            req_offsets = torch.repeat_interleave(
+                query_start_loc_device[:-1].to(torch.int32),
+                query_lens_device,
+                output_size=num_decode_tokens,
+            )
+            token_offsets = (
+                torch.arange(num_decode_tokens, dtype=torch.int32, device=dev)
+                - req_offsets
+            )
+            if self.dcp_world_size > 1 and dcp_tot_seq_lens_device is not None:
+                global_context_lens = torch.repeat_interleave(
+                    dcp_tot_seq_lens_device[:num_reqs].to(torch.int32)
+                    - query_lens_device,
+                    query_lens_device,
+                    output_size=num_decode_tokens,
+                )
+                dcp_tot_seq_lens_device = global_context_lens + token_offsets + 1
+                seq_lens_device = get_dcp_local_seq_lens(
+                    dcp_tot_seq_lens_device,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
+            else:
+                context_lens = torch.repeat_interleave(
+                    seq_lens_device[:num_reqs].to(torch.int32) - query_lens_device,
+                    query_lens_device,
+                    output_size=num_decode_tokens,
+                )
+                seq_lens_device = context_lens + token_offsets + 1
+                dcp_tot_seq_lens_device = None
+            block_table_tensor = torch.repeat_interleave(
+                block_table_tensor,
+                query_lens_device,
+                dim=0,
+                output_size=num_decode_tokens,
+            )
+            query_start_loc_device = torch.arange(
+                num_decode_tokens + 1,
+                dtype=torch.int32,
+                device=dev,
+            )
+            num_reqs = num_decode_tokens
+            tpr = 1
+
+        num_pages_per_req = (seq_lens_device + page_size - 1) // page_size
+        kv_indptr = torch.zeros(num_reqs + 1, dtype=torch.int32, device=dev)
+        torch.cumsum(num_pages_per_req, dim=0, out=kv_indptr[1:])
+        max_blk = block_table_tensor.shape[1]
+        blk_idx = torch.arange(max_blk, device=dev)
+        mask = blk_idx.unsqueeze(0) < num_pages_per_req.unsqueeze(1)
+        kv_indices = block_table_tensor[mask].to(torch.int32)
+
+        qo_indptr = torch.arange(
+            0,
+            num_reqs * tpr + 1,
+            tpr,
+            dtype=torch.int32,
+            device=dev,
+        )
+
+        if self._is_fp8_kv_cache:
+            return FlashInferMLADecodeMetadata(
+                block_table=block_table_tensor,
+                seq_lens=seq_lens_device,
+                dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+                wrapper=None,
+            )
+
+        wrapper = self._get_wrapper(num_reqs, tpr)
+        # Multi-token speculative validation has already written the whole
+        # validation span into KV cache. Keep single-token decode unmasked, but
+        # mask validation spans so token i cannot see future draft tokens.
+        causal = tpr > 1
+
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_lens_device.to(torch.int32),
+            num_heads=self.num_heads * self.dcp_world_size,
+            head_dim_ckv=self._kv_lora_rank,
+            head_dim_kpe=self._qk_rope_head_dim,
+            page_size=page_size,
+            causal=causal,
+            sm_scale=1.0 / (self._qk_nope_head_dim + self._qk_rope_head_dim) ** 0.5,
+            q_data_type=self._q_data_type,
+            kv_data_type=self._kv_data_type,
+        )
+
+        return FlashInferMLADecodeMetadata(
+            block_table=block_table_tensor,
+            seq_lens=seq_lens_device,
+            dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+            wrapper=wrapper,
+        )
+
+    def update_for_drafting(
+        self,
+        attn_metadata: "FlashInferMLAMetadata",
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> "FlashInferMLAMetadata":
+        # Draft MTP layers have a draft-local KV cache and should update their
+        # metadata under the same DCP=1 contract as build_for_drafting().
+        if self.dcp_world_size > 1:
+            saved = self.dcp_world_size
+            self.dcp_world_size = 1
+            try:
+                return self.update_for_drafting(
+                    attn_metadata,
+                    common_attn_metadata,
+                    draft_index,
+                )
+            finally:
+                self.dcp_world_size = saved
+
+        if self._is_fp8_kv_cache:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        max_seq_len = common_attn_metadata.max_seq_len
+        query_start_loc = common_attn_metadata.query_start_loc
+        seq_lens = common_attn_metadata.seq_lens
+
+        num_decodes, num_prefills, num_decode_tokens, _ = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+            )
+        )
+
+        if num_prefills > 0:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        attn_metadata.num_reqs = num_reqs
+        attn_metadata.max_query_len = common_attn_metadata.max_query_len
+        attn_metadata.max_seq_len = max_seq_len
+        attn_metadata.num_actual_tokens = num_tokens
+        attn_metadata.query_start_loc = query_start_loc
+        attn_metadata.slot_mapping = common_attn_metadata.slot_mapping
+        attn_metadata.num_decodes = num_decodes
+        attn_metadata.num_decode_tokens = num_decode_tokens
+        attn_metadata.num_prefills = num_prefills
+        attn_metadata.prefill = None
+
+        decode = attn_metadata.decode
+        if decode is None:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+        decode.block_table = block_table
+        decode.seq_lens = seq_lens
+        decode.dcp_tot_seq_lens = None
+
+        if self._is_fp8_kv_cache:
+            decode.wrapper = None
+            return attn_metadata
+
+        num_pages_per_req = (seq_lens + self._page_size - 1) // self._page_size
+        kv_indptr = torch.zeros(num_reqs + 1, dtype=torch.int32, device=self._device)
+        torch.cumsum(num_pages_per_req, dim=0, out=kv_indptr[1:])
+        max_blk = block_table.shape[1]
+        blk_idx = torch.arange(max_blk, device=self._device)
+        mask = blk_idx.unsqueeze(0) < num_pages_per_req.unsqueeze(1)
+        kv_indices = block_table[mask].to(torch.int32)
+
+        tpr = num_decode_tokens // num_reqs if num_reqs > 0 else 1
+        qo_indptr = torch.arange(
+            0,
+            num_reqs * tpr + 1,
+            tpr,
+            dtype=torch.int32,
+            device=self._device,
+        )
+
+        wrapper = self._get_wrapper(num_reqs, tpr)
+        # Multi-token draft updates use the same KV-cache semantics as target
+        # validation: all query tokens are present, so only the current/past
+        # tokens in the span are visible to each query.
+        causal = tpr > 1
+
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            seq_lens.to(torch.int32),
+            num_heads=self.num_heads * self.dcp_world_size,
+            head_dim_ckv=self._kv_lora_rank,
+            head_dim_kpe=self._qk_rope_head_dim,
+            page_size=self._page_size,
+            causal=causal,
+            sm_scale=1.0 / (self._qk_nope_head_dim + self._qk_rope_head_dim) ** 0.5,
+            q_data_type=self._q_data_type,
+            kv_data_type=self._kv_data_type,
+        )
+        decode.wrapper = wrapper
+
+        return attn_metadata
+
+
+@dataclass
+class FlashInferMLAMetadata(MLACommonMetadata[FlashInferMLADecodeMetadata]):
+    pass
+
+
+class FlashInferMLABackend(MLACommonBackend):
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [MultipleOf(1)]
+
+    @staticmethod
+    def get_name() -> str:
+        return "FLASHINFER_MLA"
+
+    @staticmethod
+    def get_impl_cls() -> type["FlashInferMLAImpl"]:
+        return FlashInferMLAImpl
+
+    @staticmethod
+    def get_builder_cls() -> type["FlashInferMLAMetadataBuilder"]:
+        return FlashInferMLAMetadataBuilder
+
+    @classmethod
+    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        return capability.major >= 10
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size,
+        dtype,
+        kv_cache_dtype,
+        block_size,
+        use_mla,
+        has_sink,
+        use_sparse,
+        device_capability,
+    ) -> str | None:
+        from vllm.config import get_current_vllm_config
+
+        if (
+            device_capability.major == 12
+            and kv_cache_dtype is not None
+            and is_quantized_kv_cache(kv_cache_dtype)
+        ):
+            return (
+                "FlashInfer MLA on SM120 currently requires "
+                "float16/bfloat16 KV cache"
+            )
+
+        vllm_config = get_current_vllm_config()
+        if vllm_config.model_config is not None:
+            hf_text_config = vllm_config.model_config.hf_text_config
+            qk_nope_head_dim = getattr(hf_text_config, "qk_nope_head_dim", 1)
+            if qk_nope_head_dim not in [64, 128, 192]:
+                return (
+                    "FlashInfer MLA kernel requires qk_nope_head_dim "
+                    f"in [64, 128, 192], but got {qk_nope_head_dim}"
+                )
+        return None
+
+    @classmethod
+    def get_required_kv_cache_layout(cls) -> "KVCacheLayoutType | None":
+        return "HND"
+
+
+class FlashInferMLAImpl(MLACommonImpl[FlashInferMLAMetadata]):
+    can_return_lse_for_decode: bool = True
+
+    def __init__(self, num_heads, head_size, scale, num_kv_heads,
+                 alibi_slopes, sliding_window, kv_cache_dtype,
+                 logits_soft_cap, attn_type, kv_sharing_target_layer_name,
+                 **mla_args):
+        super().__init__(num_heads, head_size, scale, num_kv_heads,
+                         alibi_slopes, sliding_window, kv_cache_dtype,
+                         logits_soft_cap, attn_type, kv_sharing_target_layer_name,
+                         **mla_args)
+        if any([alibi_slopes, sliding_window, logits_soft_cap]):
+            raise NotImplementedError(
+                "FlashInferMLAImpl does not support "
+                "alibi/sliding_window/logits_soft_cap")
+        if attn_type != AttentionType.DECODER:
+            raise NotImplementedError("Only decoder attention supported")
+
+    def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
+        assert kv_c_and_k_pe_cache.numel() > 0
+        assert attn_metadata.decode is not None
+        is_fp8_kv_cache = is_quantized_kv_cache(self.kv_cache_dtype)
+
+        if is_fp8_kv_cache:
+            if self.dcp_world_size > 1:
+                raise NotImplementedError(
+                    "FLASHINFER_MLA FP8 decode under DCP still needs an "
+                    "LSE-returning low-level kernel path."
+                )
+            if isinstance(q, tuple):
+                raise NotImplementedError(
+                    "FLASHINFER_MLA FP8 decode expects quantized queries from "
+                    "the common MLA layer."
+                )
+
+            num_reqs = attn_metadata.decode.seq_lens.shape[0]
+            if num_reqs == 0:
+                empty = torch.empty(
+                    0,
+                    self.num_heads,
+                    self.kv_lora_rank,
+                    dtype=torch.bfloat16,
+                    device=kv_c_and_k_pe_cache.device,
+                )
+                return empty, None
+
+            if q.shape[0] % num_reqs != 0:
+                raise ValueError(
+                    "Expected a uniform decode batch for FLASHINFER_MLA FP8, "
+                    f"got {q.shape[0]} tokens across {num_reqs} requests."
+                )
+
+            tokens_per_req = q.shape[0] // num_reqs
+            query = q.contiguous().view(num_reqs, tokens_per_req, q.shape[1], q.shape[2])
+            backend = "auto" if tokens_per_req == 1 else "trtllm-gen"
+            bmm1_scale = layer._q_scale_float * layer._k_scale_float * self.scale
+            bmm2_scale = layer._k_scale_float
+            block_tables = attn_metadata.decode.block_table
+            block_align = max(1, 128 // kv_c_and_k_pe_cache.size(1))
+            if block_tables.shape[1] % block_align != 0:
+                pad_cols = block_align - (block_tables.shape[1] % block_align)
+                block_tables = torch.cat(
+                    [
+                        block_tables,
+                        torch.zeros(
+                            block_tables.shape[0],
+                            pad_cols,
+                            dtype=block_tables.dtype,
+                            device=block_tables.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            out = trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_c_and_k_pe_cache,
+                workspace_buffer=_get_shared_workspace(query.device),
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=attn_metadata.decode.seq_lens.to(torch.int32),
+                max_seq_len=attn_metadata.max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                backend=backend,
+            )
+            return out.contiguous().view(-1, out.shape[2], out.shape[3]), None
+
+        if isinstance(q, tuple):
+            q_nope, q_pe = q
+        else:
+            q_nope = q[:, :, :self.kv_lora_rank]
+            q_pe = q[:, :, self.kv_lora_rank:]
+
+        # Split KV cache: (blocks, block_size, 576) -> ckv(512) + kpe(64)
+        # No .contiguous() — SGLang also passes strided slices, flashinfer handles it
+        ckv_cache = kv_c_and_k_pe_cache[:, :, :self.kv_lora_rank].unsqueeze(2)
+        kpe_cache = kv_c_and_k_pe_cache[:, :, self.kv_lora_rank:].unsqueeze(2)
+
+        wrapper = attn_metadata.decode.wrapper
+        assert wrapper is not None
+        o, lse = wrapper.run(
+            q_nope.contiguous(), q_pe.contiguous(),
+            ckv_cache, kpe_cache, return_lse=True, return_lse_base_on_e=True)
+
+        v_scale = layer._v_scale_float
+        if v_scale != 1.0:
+            o = o * v_scale
+
+        return o.contiguous(), lse

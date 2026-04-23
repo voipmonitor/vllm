@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import threading
+from contextlib import contextmanager
 from weakref import WeakValueDictionary
 
 import torch
@@ -113,6 +115,20 @@ class All2AllManagerBase:
         pass
 
 
+@contextmanager
+def _without_nccl_graph_file_for_group(unique_name: str):
+    disable = unique_name.split(":")[0] == "dcp" and bool(os.getenv("NCCL_GRAPH_FILE"))
+    if not disable:
+        yield
+        return
+    old = os.environ.pop("NCCL_GRAPH_FILE", None)
+    try:
+        yield
+    finally:
+        if old is not None:
+            os.environ["NCCL_GRAPH_FILE"] = old
+
+
 class DeviceCommunicatorBase:
     """
     Base class for device-specific communicator.
@@ -176,7 +192,8 @@ class DeviceCommunicatorBase:
         self.all2all_manager: All2AllManagerBase | None = None
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        dist.all_reduce(input_, group=self.device_group)
+        with _without_nccl_graph_file_for_group(self.unique_name):
+            dist.all_reduce(input_, group=self.device_group)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -193,7 +210,8 @@ class DeviceCommunicatorBase:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        with _without_nccl_graph_file_for_group(self.unique_name):
+            dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -238,9 +256,10 @@ class DeviceCommunicatorBase:
         )
 
         # Perform reduce-scatter operation
-        torch.distributed.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
+        with _without_nccl_graph_file_for_group(self.unique_name):
+            torch.distributed.reduce_scatter_tensor(
+                output_tensor, input_tensor, group=self.device_group
+            )
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()

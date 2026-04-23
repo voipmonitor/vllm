@@ -78,10 +78,7 @@ def get_attn_backend(
     else:
         block_size = None
 
-    speculative_config = vllm_config.speculative_config
-    use_non_causal = (
-        speculative_config is not None and speculative_config.method == "dflash"
-    )
+    use_non_causal = vllm_config.attention_config.use_non_causal
 
     attn_selector_config = AttentionSelectorConfig(
         head_size=head_size,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 from torch.distributed import ProcessGroup
@@ -71,7 +72,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
-        if self.world_size > 1:
+        skip_pynccl_for_dcp = (
+            self.world_size > 1
+            and "dcp" in unique_name
+            and bool(os.getenv("NCCL_GRAPH_FILE"))
+        )
+        if skip_pynccl_for_dcp:
+            logger.info_once(
+                "Skipping PyNcclCommunicator for DCP group %s because "
+                "NCCL_GRAPH_FILE is set; DCP will use torch.distributed "
+                "collectives on the existing NCCL process group instead.",
+                unique_name,
+                scope="global",
+            )
+        elif self.world_size > 1:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group if tcp_store_group is None else tcp_store_group,
                 device=self.device,
@@ -239,7 +253,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
+        if pynccl_comm is None or pynccl_comm.disabled:
+            return super().reduce_scatter(input_, dim)
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()

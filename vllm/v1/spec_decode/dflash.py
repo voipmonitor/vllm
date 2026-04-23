@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -66,6 +67,32 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         # For DFlash we use the input embeddings to embed the mask token
         self.parallel_drafting_hidden_state_tensor = None
+
+    @override
+    def _create_draft_vllm_config(self) -> VllmConfig:
+        base = super()._create_draft_vllm_config()
+        spec_cfg = self.speculative_config
+
+        attention_config = replace(
+            base.attention_config,
+            use_non_causal=True,
+        )
+
+        cache_config = base.cache_config
+        if (
+            spec_cfg.dflash_draft_window_size is not None
+            and cache_config is not None
+        ):
+            cache_config = replace(
+                cache_config,
+                sliding_window=spec_cfg.dflash_draft_window_size,
+            )
+
+        return replace(
+            base,
+            attention_config=attention_config,
+            cache_config=cache_config,
+        )
 
     @override
     def _raise_if_multimodal(self):

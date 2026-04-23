@@ -660,6 +660,22 @@ class FlashAttentionImpl(AttentionImpl):
         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
 
         vllm_config = get_current_vllm_config_or_none()
+        # Draft models can run inside a target worker that has DCP process
+        # groups already initialized. In that case, the backend-level DCP
+        # world size inherited from global parallel state can be larger than
+        # the draft model's own configured DCP size. Respect the per-model
+        # config here so draft backends can opt out of DCP cleanly.
+        if (
+            vllm_config is not None
+            and vllm_config.parallel_config.decode_context_parallel_size <= 1
+            and self.dcp_world_size > 1
+        ):
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+            self.total_cp_world_size = self.pcp_world_size
+            self.total_cp_rank = self.pcp_rank
+            self.need_to_return_lse_for_decode = False
+
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1

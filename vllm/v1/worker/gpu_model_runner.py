@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -588,6 +589,19 @@ class GPUModelRunner(
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
+            draft_disable_above_seq_len = int(
+                os.getenv("VLLM_SPECULATIVE_DISABLE_ABOVE_SEQ_LEN", "0")
+            )
+            if draft_disable_above_seq_len > 0:
+                self.effective_drafter_max_model_len = min(
+                    self.effective_drafter_max_model_len,
+                    draft_disable_above_seq_len,
+                )
+                logger.info(
+                    "Speculative decoding will be disabled for sequence lengths "
+                    "above %d via VLLM_SPECULATIVE_DISABLE_ABOVE_SEQ_LEN.",
+                    self.effective_drafter_max_model_len,
+                )
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
@@ -862,6 +876,14 @@ class GPUModelRunner(
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
                 self.effective_drafter_max_model_len = self.max_model_len
+            draft_disable_above_seq_len = int(
+                os.getenv("VLLM_SPECULATIVE_DISABLE_ABOVE_SEQ_LEN", "0")
+            )
+            if draft_disable_above_seq_len > 0:
+                self.effective_drafter_max_model_len = min(
+                    self.effective_drafter_max_model_len,
+                    draft_disable_above_seq_len,
+                )
 
     def reset_mm_cache(self) -> None:
         """
@@ -2162,8 +2184,16 @@ class GPUModelRunner(
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
 
         if self.use_async_spec_decode:
-            # GPU tensors are authoritative in async mode.
-            seq_lens_cpu = None
+            # GPU tensors are authoritative in async mode. Keep the optimistic
+            # seq_lens_cpu available though — MLA's metadata builder uses it
+            # to compute context_lens for chunked-prefill workspace sizing,
+            # which only needs an upper bound on context length and can
+            # tolerate the optimistic value. This avoids a catastrophic
+            # GPU->CPU sync in the prefill branch when eagle3/MTP verification
+            # batches arrive with max_query_len>1 (otherwise
+            # mla_attention.build() calls compute_num_computed_tokens().cpu()
+            # which stalls on in-flight target-model work, adding ~40-80 ms
+            # per decode step at 30k ctx).
             num_computed_tokens_cpu = None
 
         cm_base = CommonAttentionMetadata(
@@ -4032,6 +4062,17 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            try:
+                from vllm.v1.spec_decode._mtp_timing import (
+                    enter as _t_enter_tgt,
+                    exit as _t_exit_tgt,
+                )
+            except Exception:
+                def _t_enter_tgt(_):
+                    pass
+                def _t_exit_tgt(_):
+                    pass
+            _t_enter_tgt("TGT_model_forward")
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4039,6 +4080,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            _t_exit_tgt("TGT_model_forward")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4122,6 +4164,22 @@ class GPUModelRunner(
 
     @torch.inference_mode
     def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        try:
+            return self._sample_tokens_impl(grammar_output)
+        finally:
+            # Re-record the prepare_inputs_event AFTER sample_tokens
+            # (which includes the spec-decode proposer) so the NEXT
+            # batch's execute_model waits for ALL GPU work from this
+            # step -- not just execute_model but also the proposer.
+            # Without this, the batch queue allows the next batch's
+            # _update_states to modify block tables while the current
+            # batch's proposer is still reading them on the GPU.
+            if self.prepare_inputs_event is not None:
+                self.prepare_inputs_event.record()
+
+    def _sample_tokens_impl(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is None:
@@ -4209,6 +4267,19 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
             )
+            # The draft attention metadata can under-report long prompt length for
+            # EAGLE-style decode paths, so also gate on the actual request seq len.
+            if input_fits_in_drafter and self.input_batch.num_reqs > 0:
+                actual_max_seq_len = int(
+                    self.optimistic_seq_lens_cpu[: self.input_batch.num_reqs].max()
+                )
+                # optimistic_seq_lens_cpu already tracks the global request length.
+                # Multiplying by dcp_world_size double-counts context length and
+                # incorrectly disables drafting for DCP runs.
+                if actual_max_seq_len + self.num_spec_tokens > (
+                    self.effective_drafter_max_model_len
+                ):
+                    input_fits_in_drafter = False
             use_gpu_toks = (
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
