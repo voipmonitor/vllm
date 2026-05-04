@@ -2,11 +2,13 @@ FROM voipmonitor/vllm:glm51-dcp-nccl2127-noxml-b12x0111-20260504
 
 ARG VLLM_UPSTREAM_COMMIT=unknown
 ARG VLLM_PORT_BRANCH=unknown
+ARG FLASHINFER_VERSION=0.6.10rc1
 
 LABEL org.opencontainers.image.description="vLLM upstream-main GLM/Kimi NSA/MTP/DCP port"
 LABEL vllm.upstream.commit="${VLLM_UPSTREAM_COMMIT}"
 LABEL vllm.port.branch="${VLLM_PORT_BRANCH}"
 LABEL nccl.pr="https://github.com/NVIDIA/nccl/pull/2127"
+LABEL flashinfer.version="${FLASHINFER_VERSION}"
 
 WORKDIR /opt/vllm
 COPY . /opt/vllm
@@ -17,3 +19,9 @@ RUN rm -rf /opt/vllm/vllm.egg-info \
        /opt/vllm/tools/launch_scripts \
     && rm -rf /cache/jit/* /root/.cache/cutlass_dsl/* /root/.cache/triton/* || true
 
+RUN /opt/venv/bin/pip install --no-cache-dir --upgrade --pre --no-deps \
+       "flashinfer-python==${FLASHINFER_VERSION}" \
+       "flashinfer-cubin==${FLASHINFER_VERSION}" \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade --pre --no-deps \
+       --index-url https://flashinfer.ai/whl/cu130 \
+       "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130"
