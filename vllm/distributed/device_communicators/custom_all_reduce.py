@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
+from functools import lru_cache
+import os
+from pathlib import Path
+from typing import Any
 from typing import cast
 
 import torch
@@ -26,6 +30,136 @@ except Exception:
     custom_ar = False
 
 logger = init_logger(__name__)
+
+
+def _is_piecewise_cudagraph_runtime() -> bool:
+    try:
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+    except Exception:
+        return False
+    return (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+    )
+
+
+def _parse_byte_size(value: str) -> int:
+    normalized = value.upper().strip()
+    suffixes = {
+        "KB": 1024,
+        "K": 1024,
+        "MB": 1024 * 1024,
+        "M": 1024 * 1024,
+    }
+    for suffix, multiplier in sorted(suffixes.items(), key=lambda item: -len(item[0])):
+        if normalized.endswith(suffix):
+            return int(normalized[: -len(suffix)]) * multiplier
+    return int(value)
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_oneshot_runtime() -> Any | None:
+    try:
+        from b12x.distributed import PCIeOneshotAllReduce
+    except Exception:
+        return None
+    return PCIeOneshotAllReduce
+
+
+def _get_physical_device_numa_node(physical_device_id: int) -> int | None:
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+        try:
+            numa_node = pynvml.nvmlDeviceGetNumaNodeId(handle)
+            if numa_node >= 0 and _numa_node_has_cpus(numa_node):
+                return int(numa_node)
+        except Exception:
+            pass
+
+        for cpu_id in _get_device_cpu_affinity(pynvml, handle):
+            numa_node = _get_numa_node_for_cpu(cpu_id)
+            if numa_node is not None:
+                return numa_node
+    except Exception:
+        return None
+    return None
+
+
+def _numa_node_has_cpus(node_id: int) -> bool:
+    try:
+        return Path(f"/sys/devices/system/node/node{node_id}/cpulist").read_text(
+            encoding="utf-8"
+        ).strip() != ""
+    except (OSError, ValueError):
+        return False
+
+
+def _get_device_cpu_affinity(pynvml: Any, handle: Any) -> list[int]:
+    cpu_count = os.cpu_count()
+    if cpu_count is None:
+        return []
+
+    cpu_set_size = (cpu_count + 63) // 64
+    cpu_affinity_mask = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
+
+    cpu_ids = []
+    for i, mask in enumerate(cpu_affinity_mask):
+        for bit in range(64):
+            cpu_id = i * 64 + bit
+            if cpu_id >= cpu_count:
+                break
+            if mask & (1 << bit):
+                cpu_ids.append(cpu_id)
+    return cpu_ids
+
+
+def _get_numa_node_for_cpu(cpu_id: int) -> int | None:
+    node_path = Path("/sys/devices/system/node")
+    if not node_path.exists():
+        return None
+
+    for node_dir in node_path.iterdir():
+        if not node_dir.name.startswith("node"):
+            continue
+        try:
+            node_id = int(node_dir.name[4:])
+            cpulist_file = node_dir / "cpulist"
+            if cpulist_file.exists() and _cpu_in_cpulist(
+                cpu_id, cpulist_file.read_text(encoding="utf-8").strip()
+            ):
+                return node_id
+        except (ValueError, OSError):
+            continue
+    return None
+
+
+def _cpu_in_cpulist(cpu_id: int, cpulist: str) -> bool:
+    for part in cpulist.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            if int(start) <= cpu_id <= int(end):
+                return True
+        elif part and cpu_id == int(part):
+            return True
+    return False
+
+
+def _is_cross_numa_topology(physical_device_ids: list[int]) -> bool:
+    numa_nodes: list[int] = []
+    for physical_device_id in physical_device_ids:
+        numa_node = _get_physical_device_numa_node(physical_device_id)
+        if numa_node is not None:
+            numa_nodes.append(numa_node)
+
+    return len(set(numa_nodes)) > 1
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -70,6 +204,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._pcie_runtime = None
+        self._ptr = 0
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -149,13 +285,17 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        use_pcie_oneshot = False
         if world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
-            )
-            return
+            if not envs.VLLM_ENABLE_PCIE_ALLREDUCE:
+                logger.warning(
+                    "Custom allreduce is disabled for >2 PCIe-only GPUs. "
+                    "Set VLLM_ENABLE_PCIE_ALLREDUCE=1 to enable P2P custom "
+                    "allreduce on PCIe topology (requires P2P-capable driver, "
+                    "see PR #39040 for details)."
+                )
+                return
+            use_pcie_oneshot = current_platform.is_cuda()
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -165,6 +305,58 @@ class CustomAllreduce:
                 "Custom allreduce is disabled because your platform lacks "
                 "GPU P2P capability or P2P test failed. To silence this "
                 "warning, specify disable_custom_all_reduce=True explicitly."
+            )
+            return
+
+        if use_pcie_oneshot:
+            allow_cross_numa = os.getenv(
+                "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1"
+            ) != "0"
+            if _is_cross_numa_topology(physical_device_ids) and not allow_cross_numa:
+                logger.warning(
+                    "Custom allreduce is disabled because b12x PCIe oneshot "
+                    "allreduce was requested on a cross-NUMA PCIe topology "
+                    "(physical_device_ids=%s). Set "
+                    "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA=1 or unset it to force it.",
+                    physical_device_ids,
+                )
+                return
+            runtime_cls = _load_b12x_pcie_oneshot_runtime()
+            if runtime_cls is None:
+                logger.warning(
+                    "PCIe custom allreduce was requested, but "
+                    "b12x.distributed.PCIeOneshotAllReduce is unavailable."
+                )
+                return
+            pcie_max_size = min(
+                max_size,
+                _parse_byte_size(
+                    os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
+                ),
+            )
+            self.max_size = pcie_max_size
+            self.rank = rank
+            self.world_size = world_size
+            self.fully_connected = False
+            self._pcie_runtime = runtime_cls.from_exchange_group(
+                exchange_group=group,
+                device=self.device,
+                eager_buffer_bytes=pcie_max_size,
+                max_size=pcie_max_size,
+            )
+            self.disabled = False
+            logger.info(
+                "Using b12x PCIe oneshot allreduce backend "
+                "(world_size=%d, max_size=%d).",
+                world_size,
+                pcie_max_size,
+            )
+            return
+
+        if world_size > 2 and not fully_connected:
+            logger.warning(
+                "Custom allreduce is disabled because this PCIe topology is not "
+                "fully connected and b12x PCIe oneshot is unavailable."
             )
             return
 
@@ -204,13 +396,20 @@ class CustomAllreduce:
         """
         try:
             self._IS_CAPTURING = True
-            yield
+            if self._pcie_runtime is None:
+                yield
+            else:
+                with self._pcie_runtime.capture():
+                    yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if not self.disabled and self._pcie_runtime is None:
                 self.register_graph_buffers()
 
     def register_graph_buffers(self):
+        if self._pcie_runtime is not None:
+            self._pcie_runtime.register_graph_buffers()
+            return
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         logger.info("Registering %d cuda graph addresses", len(offset))
         # We cannot directly use `dist.all_gather_object` here
@@ -232,14 +431,17 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        if self._pcie_runtime is not None:
+            return self._pcie_runtime.should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
+        # Keep the runtime guard aligned with the initialization contract
+        # above. For >2 PCIe GPUs we only use custom allreduce when the
+        # topology is explicitly opted in and treated as fully connected.
         if self.world_size == 2 or self.fully_connected:
             return inp_size < self.max_size
         return False
@@ -253,6 +455,8 @@ class CustomAllreduce:
         IPC-registered. Otherwise, inp is first copied into a pre-registered
         buffer.
         """
+        if self._pcie_runtime is not None:
+            return self._pcie_runtime.all_reduce(inp, out=out)
         if out is None:
             out = torch.empty_like(inp)
         if registered:
@@ -272,6 +476,11 @@ class CustomAllreduce:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(input, registered=True)
             else:
+                # Piecewise CUDA graph execution can run split ops eagerly while
+                # graph capture bookkeeping is active. Those ops need a real
+                # all-reduce; returning a placeholder is only valid for warmup.
+                if _is_piecewise_cudagraph_runtime():
+                    return self.all_reduce(input, registered=False)
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
                 return torch.empty_like(input)
@@ -282,6 +491,9 @@ class CustomAllreduce:
             return self.all_reduce(input, registered=False)
 
     def close(self):
+        if self._pcie_runtime is not None:
+            self._pcie_runtime.close()
+            self._pcie_runtime = None
         if not self.disabled and self._ptr:
             if ops is not None:
                 ops.dispose(self._ptr)

@@ -734,6 +734,41 @@ class Indexer(nn.Module):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
+def _should_skip_index_topk(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int | None,
+) -> bool:
+    """Match GLM/DeepSeek IndexCache top-k reuse policy.
+
+    A layer marked as "S" reuses the previous layer's top-k indices. MTP/NextN
+    layers are excluded because they do not have a normal previous layer in the
+    same stack to reuse from.
+    """
+    if layer_idx is None:
+        return False
+
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+        return False
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        if 0 <= layer_idx < len(pattern):
+            return pattern[layer_idx] == "S"
+        if num_hidden_layers is not None and layer_idx < num_hidden_layers:
+            logger.warning_once(
+                "index_topk_pattern is shorter than num_hidden_layers; "
+                "not skipping sparse MLA indexer computation on layer %s.",
+                layer_idx,
+            )
+        return False
+
+    freq = getattr(config, "index_topk_freq", None)
+    if freq is None:
+        return False
+    return max(layer_idx - 1, 0) % freq != 0
+
+
 def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     """
     We fuse the WK and weights_proj projections, but in some checkpoints WK is stored
@@ -1001,19 +1036,14 @@ class DeepseekV2MLAAttention(nn.Module):
                 f"{prefix}.indexer",
             )
 
-            # Enable IndexCache for DeepSeek models to reduce redundant top-k
-            # token selection computations in sparse attention.
-            use_index_cache = getattr(config, "use_index_cache", False)
-            if use_index_cache:
-                # IndexCache config
-                # Refer: https://arxiv.org/abs/2603.12201 for more details.
-                _index_topk_freq = getattr(config, "index_topk_freq", 1)
-                _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                layer_id = extract_layer_index(prefix)
-                if _index_topk_pattern is None:
-                    _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
-                elif 0 <= layer_id < len(_index_topk_pattern):
-                    _skip_topk = _index_topk_pattern[layer_id] == "S"
+            layer_id = extract_layer_index(prefix)
+            _skip_topk = _should_skip_index_topk(config, layer_id)
+            if _skip_topk:
+                logger.info_once(
+                    "Using index_topk_pattern/index_topk_freq to skip sparse MLA "
+                    "indexer computation on layer %s.",
+                    layer_id,
+                )
 
         else:
             self.indexer_rope_emb = None

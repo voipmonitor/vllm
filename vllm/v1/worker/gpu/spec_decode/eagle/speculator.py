@@ -20,8 +20,6 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import (
-    BatchExecutionDescriptor,
-    CapturedAttentionState,
     get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -29,8 +27,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
-    DecodeEagleCudaGraphManager,
-    PrefillEagleCudaGraphManager,
+    EagleCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
@@ -56,11 +53,6 @@ class EagleSpeculator:
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
         self.hidden_size = self.draft_model_config.get_hidden_size()
-        # Widen for HC-multiplexed residuals (e.g. DeepSeek V4 feeds the MTP
-        # draft the target's pre-hc_head (T, hc_mult * hidden_size) residual).
-        # Non-HC models default to hc_mult=1 and are unaffected.
-        hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
-        self.hidden_size = self.hidden_size * hc_mult
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
 
@@ -102,7 +94,7 @@ class EagleSpeculator:
             )
 
         self.draft_logits: torch.Tensor | None = None
-        if self.speculative_config.draft_sample_method == "gumbel":
+        if self.speculative_config.rejection_sample_method == "probabilistic":
             self.draft_logits = torch.zeros(
                 self.max_num_reqs,
                 self.num_speculative_steps,
@@ -111,13 +103,13 @@ class EagleSpeculator:
                 device=device,
             )
 
-        self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
-        self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
+        self.prefill_cudagraph_manager: EagleCudaGraphManager | None = None
+        self.decode_cudagraph_manager: EagleCudaGraphManager | None = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
         # Initialize cudagraph manager for draft prefill (draft position 0).
-        self.prefill_cudagraph_manager = PrefillEagleCudaGraphManager(
+        self.prefill_cudagraph_manager = EagleCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -134,7 +126,7 @@ class EagleSpeculator:
             cudagraph_mode = CUDAGraphMode.NONE
 
         # Initialize cudagraph manager for draft decodes (draft positions > 0).
-        self.decode_cudagraph_manager = DecodeEagleCudaGraphManager(
+        self.decode_cudagraph_manager = EagleCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -223,28 +215,6 @@ class EagleSpeculator:
             last_hidden_states, hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
 
-    def _sample_draft(
-        self,
-        logits: torch.Tensor,
-        idx_mapping: torch.Tensor,
-        pos: torch.Tensor,
-        step: int,
-    ) -> torch.Tensor:
-        if self.draft_logits is not None:
-            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
-            # used for draft and target sampling.
-            return gumbel_sample(
-                logits,
-                idx_mapping,
-                self.temperature,
-                self.seeds,
-                pos + 1,
-                apply_temperature=True,
-                processed_logits_out=self.draft_logits[:, step],
-            )
-        else:
-            return logits.argmax(dim=-1)
-
     def prefill(
         self,
         num_reqs: int,
@@ -270,11 +240,18 @@ class EagleSpeculator:
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
 
-        self.draft_tokens[:num_reqs, 0] = self._sample_draft(
+        # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
+        # used for draft and target sampling.
+        self.draft_tokens[:num_reqs, 0] = gumbel_sample(
             logits,
             idx_mapping,
-            pos,
-            step=0,
+            self.temperature,
+            self.seeds,
+            pos + 1,
+            apply_temperature=True,
+            processed_logits_out=self.draft_logits[:, 0]
+            if self.draft_logits is not None
+            else None,
         )
         self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = pos
@@ -304,11 +281,18 @@ class EagleSpeculator:
             hidden_states = hidden_states[:num_reqs]
             logits = self.model.compute_logits(last_hidden_states)
 
-            draft_tokens = self._sample_draft(
+            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
+            # used for draft and target sampling.
+            draft_tokens = gumbel_sample(
                 logits,
                 idx_mapping,
-                pos,
-                step=step,
+                self.temperature,
+                self.seeds,
+                pos + 1,
+                apply_temperature=True,
+                processed_logits_out=self.draft_logits[:, step]
+                if self.draft_logits is not None
+                else None,
             )
             self.draft_tokens[:num_reqs, step] = draft_tokens
 
@@ -363,10 +347,7 @@ class EagleSpeculator:
         )
         return attn_metadata
 
-    def capture(
-        self,
-        attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
-    ) -> None:
+    def capture_model(self) -> None:
         logger.info("Capturing model for Eagle speculator...")
         # Reset indices to zeros to prevent stale values from prior
         # dummy runs to cause out-of-bounds indexing during capture.
@@ -380,7 +361,11 @@ class EagleSpeculator:
         assert self.prefill_cudagraph_manager is not None
         self.prefill_cudagraph_manager.capture(
             self.prefill,
-            attn_states,
+            self.model_state,
+            self.input_buffers,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
             progress_bar_desc="Capturing eagle prefill CUDA graphs",
         )
 
@@ -485,6 +470,15 @@ class EagleSpeculator:
         )
 
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # It is necessary to rebuild the attention metadata when
+            # replaying the FULL graph so that any attention metadata
+            # builder state is updated.
+            self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=prefill_batch_desc.num_reqs or num_reqs,
+                num_tokens_padded=prefill_batch_desc.num_tokens,
+                max_query_len=self.num_speculative_steps + 1,
+            )
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
             self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)

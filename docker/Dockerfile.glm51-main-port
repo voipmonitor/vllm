@@ -1,0 +1,19 @@
+FROM voipmonitor/vllm:glm51-dcp-nccl2127-noxml-b12x0111-20260504
+
+ARG VLLM_UPSTREAM_COMMIT=unknown
+ARG VLLM_PORT_BRANCH=unknown
+
+LABEL org.opencontainers.image.description="vLLM upstream-main GLM/Kimi NSA/MTP/DCP port"
+LABEL vllm.upstream.commit="${VLLM_UPSTREAM_COMMIT}"
+LABEL vllm.port.branch="${VLLM_PORT_BRANCH}"
+LABEL nccl.pr="https://github.com/NVIDIA/nccl/pull/2127"
+
+WORKDIR /opt/vllm
+COPY . /opt/vllm
+
+RUN rm -rf /opt/vllm/vllm.egg-info \
+    && /opt/venv/bin/python -m compileall -q \
+       /opt/vllm/vllm \
+       /opt/vllm/tools/launch_scripts \
+    && rm -rf /cache/jit/* /root/.cache/cutlass_dsl/* /root/.cache/triton/* || true
+
