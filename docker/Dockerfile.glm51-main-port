@@ -14,8 +14,10 @@ WORKDIR /opt/vllm
 COPY . /opt/vllm
 
 RUN rm -rf /opt/vllm/vllm.egg-info \
+    && cp -a /opt/vllm/vllm /opt/venv/lib/python3.12/site-packages/ \
     && /opt/venv/bin/python -m compileall -q \
        /opt/vllm/vllm \
+       /opt/venv/lib/python3.12/site-packages/vllm \
        /opt/vllm/tools/launch_scripts \
     && rm -rf /cache/jit/* /root/.cache/cutlass_dsl/* /root/.cache/triton/* || true
 

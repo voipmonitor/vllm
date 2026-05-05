@@ -788,7 +788,9 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        propagate_dcp_to_draft=self.method in get_args(MTPModelTypes),
                     )
                 )
 
@@ -950,29 +952,35 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        propagate_dcp_to_draft: bool = False,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
         """
+        dcp_kwargs = {}
+        if propagate_dcp_to_draft:
+            dcp_kwargs = {
+                "decode_context_parallel_size": (
+                    target_parallel_config.decode_context_parallel_size
+                ),
+                "dcp_kv_cache_interleave_size": (
+                    target_parallel_config.dcp_kv_cache_interleave_size
+                ),
+                "dcp_comm_backend": target_parallel_config.dcp_comm_backend,
+                "cp_kv_cache_interleave_size": (
+                    target_parallel_config.cp_kv_cache_interleave_size
+                ),
+            }
         draft_parallel_config = ParallelConfig(
             pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
-            decode_context_parallel_size=(
-                target_parallel_config.decode_context_parallel_size
-            ),
-            dcp_kv_cache_interleave_size=(
-                target_parallel_config.dcp_kv_cache_interleave_size
-            ),
-            dcp_comm_backend=target_parallel_config.dcp_comm_backend,
-            cp_kv_cache_interleave_size=(
-                target_parallel_config.cp_kv_cache_interleave_size
-            ),
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
             ray_workers_use_nsight=target_parallel_config.ray_workers_use_nsight,
             placement_group=target_parallel_config.placement_group,
+            **dcp_kwargs,
         )
 
         return draft_parallel_config
