@@ -32,6 +32,16 @@ except Exception:
 logger = init_logger(__name__)
 
 
+def _get_pcie_allreduce_backend() -> str:
+    backend = os.getenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x").lower()
+    if backend not in {"b12x", "cpp"}:
+        raise ValueError(
+            "Invalid VLLM_PCIE_ALLREDUCE_BACKEND: "
+            f"{backend!r}. Valid values: b12x, cpp."
+        )
+    return backend
+
+
 def _is_piecewise_cudagraph_runtime() -> bool:
     try:
         from vllm.config import CUDAGraphMode
@@ -295,7 +305,19 @@ class CustomAllreduce:
                     "see PR #39040 for details)."
                 )
                 return
-            use_pcie_oneshot = current_platform.is_cuda()
+            pcie_backend = _get_pcie_allreduce_backend()
+            if pcie_backend == "cpp":
+                logger.info(
+                    "PCIe custom allreduce enabled via "
+                    "VLLM_ENABLE_PCIE_ALLREDUCE=1 "
+                    "(backend=cpp, using vLLM C++ custom allreduce)."
+                )
+                # Preserve the legacy PCIe opt-in behavior: allow the same
+                # small-tensor C++ custom allreduce path as fully-connected
+                # topologies once the user explicitly enables it.
+                fully_connected = True
+            else:
+                use_pcie_oneshot = current_platform.is_cuda()
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
