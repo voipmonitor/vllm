@@ -251,6 +251,8 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
+    VLLM_ENABLE_MLA_PREATTN_FANOUT: bool = False
+    BOB_ENABLE_EAGLE3_FANOUT: bool = False
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -1711,6 +1713,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    ),
+    # Enable sparse MLA pre-attention GEMM fan-out. The MLA layer auto-enables
+    # this for validated sparse MLA backends unless the env var is explicit.
+    "VLLM_ENABLE_MLA_PREATTN_FANOUT": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_MLA_PREATTN_FANOUT", "0"))
+    ),
+    # Optional dense MLA fan-out hook for draft models. Default off.
+    "BOB_ENABLE_EAGLE3_FANOUT": lambda: bool(
+        int(os.getenv("BOB_ENABLE_EAGLE3_FANOUT", "0"))
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
