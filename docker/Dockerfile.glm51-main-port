@@ -18,10 +18,13 @@ RUN rm -rf /opt/vllm/vllm.egg-info \
        /opt/venv/lib/python3.12/site-packages/vllm/config/speculative.py \
     && cp /opt/vllm/vllm/distributed/device_communicators/custom_all_reduce.py \
        /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/custom_all_reduce.py \
+    && cp /opt/vllm/vllm/distributed/device_communicators/cuda_communicator.py \
+       /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py \
     && /opt/venv/bin/python -m compileall -q \
        /opt/vllm/vllm \
        /opt/venv/lib/python3.12/site-packages/vllm/config/speculative.py \
        /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/custom_all_reduce.py \
+       /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py \
        /opt/vllm/tools/launch_scripts \
     && rm -rf /cache/jit/* /root/.cache/cutlass_dsl/* /root/.cache/triton/* || true
 

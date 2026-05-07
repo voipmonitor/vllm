@@ -1,0 +1,49 @@
+FROM voipmonitor/vllm:glm51-kimi-main-pciearselect-20260505
+
+COPY vllm/distributed/device_communicators/custom_all_reduce.py \
+  /opt/vllm/vllm/distributed/device_communicators/custom_all_reduce.py
+COPY vllm/distributed/device_communicators/custom_all_reduce.py \
+  /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/custom_all_reduce.py
+COPY vllm/compilation/passes/fusion/allreduce_rms_fusion.py \
+  /opt/vllm/vllm/compilation/passes/fusion/allreduce_rms_fusion.py
+COPY vllm/compilation/passes/fusion/allreduce_rms_fusion.py \
+  /opt/venv/lib/python3.12/site-packages/vllm/compilation/passes/fusion/allreduce_rms_fusion.py
+COPY rtx6k-pcie-fused-allreduce/ /opt/rtx6k-pcie-fused-allreduce/
+COPY scripts/run-glm51-vllm /usr/local/bin/run-glm51-vllm
+COPY scripts/run-kimi26-vllm /usr/local/bin/run-kimi26-vllm
+
+RUN rm -rf \
+    /opt/vllm/vllm/distributed/device_communicators/__pycache__ \
+    /opt/vllm/vllm/compilation/passes/fusion/__pycache__ \
+    /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/__pycache__ \
+    /opt/venv/lib/python3.12/site-packages/vllm/compilation/passes/fusion/__pycache__ \
+  && chmod +x /usr/local/bin/run-glm51-vllm /usr/local/bin/run-kimi26-vllm
+
+ENV NCCL_GRAPH_FILE="" \
+    NCCL_P2P_LEVEL=SYS \
+    NCCL_PROTO=LL,LL128,Simple \
+    NCCL_IB_DISABLE=1 \
+    VLLM_NCCL_SO_PATH=/opt/libnccl-pr2127.so.2.30.3 \
+    LD_PRELOAD=/opt/libnccl-pr2127.so.2.30.3 \
+    VLLM_ENABLE_PCIE_ALLREDUCE=1 \
+    VLLM_PCIE_ALLREDUCE_BACKEND=cpp \
+    VLLM_CPP_AR_1STAGE_NCCL_CUTOFF=56KB \
+    VLLM_RTX6K_PCIE_FUSED_ALLREDUCE_PATH=/opt/rtx6k-pcie-fused-allreduce \
+    VLLM_RTX6K_FUSED_ALLREDUCE_ADD=0 \
+    VLLM_RTX6K_FUSED_ALLREDUCE_ADD_1STAGE_MAX_SIZE=56KB \
+    VLLM_RTX6K_FUSED_ALLREDUCE_ADD_END_BARRIER=1 \
+    VLLM_USE_B12X_SPARSE_INDEXER=1 \
+    VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
+    VLLM_LOG_STATS_INTERVAL=1 \
+    VLLM_B12X_MLA_SPEC_SERIAL_DECODE=0 \
+    VLLM_MTP_RETURN_NORMALIZED_HIDDEN=1 \
+    VLLM_SPEC_ACCEPT_THRESHOLD_ACC=1.0 \
+    VLLM_SPEC_ACCEPT_THRESHOLD_SINGLE=1.0
+
+LABEL org.opencontainers.image.description="vLLM GLM/Kimi communicator selector image with patched NCCL, cpp PCIe AR, and opt-in RTX6K fused AR experiments" \
+      voipmonitor.communicator.base="voipmonitor/vllm:glm51-kimi-main-pciearselect-20260505" \
+      voipmonitor.communicator.default="patched-nccl-pr2127+cpp-selector+fusedadd-off" \
+      voipmonitor.communicator.custom_all_reduce_sha256="7154f2ce49b5bdb1e2028219d39f189eaf1d35fc520344b1376f593736f6c23e" \
+      voipmonitor.communicator.allreduce_rms_fusion_sha256="44e8dbb86da1a68effe2577e4200933169b3958c127c58a3d276bb3b1cb60d7f" \
+      voipmonitor.communicator.rtx6k_pcie_allreduce_cu_sha256="1126e00c8d401c14138fcfb9247e5ab6c726f59443bc5416816bd817ae9bfab9" \
+      voipmonitor.communicator.rtx6k_pcie_allreduce_py_sha256="76cce6b2ca1adedd8d8ba875a7db911943278272d0c9f982b816c9102f3b9ed2"
