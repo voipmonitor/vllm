@@ -8,6 +8,14 @@ COPY vllm/compilation/passes/fusion/allreduce_rms_fusion.py \
   /opt/vllm/vllm/compilation/passes/fusion/allreduce_rms_fusion.py
 COPY vllm/compilation/passes/fusion/allreduce_rms_fusion.py \
   /opt/venv/lib/python3.12/site-packages/vllm/compilation/passes/fusion/allreduce_rms_fusion.py
+COPY vllm/v1/attention/backends/mla/triton_mla.py \
+  /opt/vllm/vllm/v1/attention/backends/mla/triton_mla.py
+COPY vllm/v1/attention/backends/mla/triton_mla.py \
+  /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/triton_mla.py
+COPY vllm/v1/attention/backends/mla/triton_mla_tuning.py \
+  /opt/vllm/vllm/v1/attention/backends/mla/triton_mla_tuning.py
+COPY vllm/v1/attention/backends/mla/triton_mla_tuning.py \
+  /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/triton_mla_tuning.py
 COPY rtx6k-pcie-fused-allreduce/ /opt/rtx6k-pcie-fused-allreduce/
 COPY scripts/run-glm51-vllm /usr/local/bin/run-glm51-vllm
 COPY scripts/run-kimi26-vllm /usr/local/bin/run-kimi26-vllm
@@ -15,8 +23,10 @@ COPY scripts/run-kimi26-vllm /usr/local/bin/run-kimi26-vllm
 RUN rm -rf \
     /opt/vllm/vllm/distributed/device_communicators/__pycache__ \
     /opt/vllm/vllm/compilation/passes/fusion/__pycache__ \
+    /opt/vllm/vllm/v1/attention/backends/mla/__pycache__ \
     /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/__pycache__ \
     /opt/venv/lib/python3.12/site-packages/vllm/compilation/passes/fusion/__pycache__ \
+    /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/__pycache__ \
   && chmod +x /usr/local/bin/run-glm51-vllm /usr/local/bin/run-kimi26-vllm
 
 ENV NCCL_GRAPH_FILE="" \
