@@ -100,6 +100,7 @@ _USE_SGL_KERNEL_FAST_TOPK_TRANSFORM = bool(
 _USE_B12X_INDEXER_WORKSPACE = (
     os.getenv("VLLM_B12X_INDEXER_USE_WORKSPACE", "0") != "0"
 )
+_USE_B12X_INDEXER_PHANTOMS = os.getenv("VLLM_B12X_INDEXER_PHANTOMS", "1") != "0"
 _B12X_EXTEND_TOPK_SUPERTILE_K = int(
     os.getenv(
         "VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K",
@@ -422,6 +423,9 @@ def _get_b12x_indexer_phantoms(
     See `b12x.attention.nsa_indexer.api.make_nsa_indexer_contract_phantoms`
     docstring: "avoid CUTLASS recompilation when batch size varies".
     """
+    if not _USE_B12X_INDEXER_PHANTOMS:
+        return None
+
     try:
         from b12x.integration.nsa_indexer import (
             make_nsa_indexer_contract_phantoms,

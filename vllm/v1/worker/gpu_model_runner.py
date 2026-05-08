@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import json
 import os
 import threading
 import time
@@ -4230,6 +4231,11 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if (
+                cudagraph_mode == CUDAGraphMode.FULL
+                and os.getenv("VLLM_DEBUG_SYNC_BEFORE_FULL_CG", "0") == "1"
+            ):
+                torch.cuda.synchronize()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4237,6 +4243,168 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if os.getenv("VLLM_DEBUG_FULL_CG_AFTER", "0") == "1":
+            debug_count = getattr(self, "_debug_full_cg_after_count", 0)
+            debug_limit = int(os.getenv("VLLM_DEBUG_FULL_CG_AFTER_LIMIT", "16"))
+            if debug_count < debug_limit:
+                try:
+                    meta_name = None
+                    meta = None
+                    if isinstance(attn_metadata, dict):
+                        for name, value in attn_metadata.items():
+                            if hasattr(value, "page_table_1"):
+                                meta_name = name
+                                meta = value
+                                break
+                    elif hasattr(attn_metadata, "page_table_1"):
+                        meta_name = "<direct>"
+                        meta = attn_metadata
+
+                    if meta is not None:
+                        rows = min(2, int(meta.page_table_1.shape[0]))
+                        cols = min(16, int(meta.page_table_1.shape[1]))
+                        page = meta.page_table_1[:rows, :cols].detach().cpu().tolist()
+                        nsa = meta.nsa_cache_seqlens[:rows].detach().cpu().tolist()
+                        cache_req = (
+                            meta.cache_seq_lens_per_req[:rows]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                        cache_tok = (
+                            meta.cache_seq_lens_per_token[:rows]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                        valid = (
+                            (meta.page_table_1[:rows] >= 0)
+                            .sum(dim=1)
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                        payload = {
+                            "count": debug_count,
+                            "cudagraph_mode": str(cudagraph_mode),
+                            "meta": meta_name,
+                            "batch_desc": str(batch_desc),
+                            "num_tokens_unpadded": int(num_tokens_unpadded),
+                            "num_tokens_padded": int(num_tokens_padded),
+                            "num_reqs": int(num_reqs),
+                            "num_reqs_padded": int(num_reqs_padded),
+                            "max_scheduled": int(max_num_scheduled_tokens),
+                            "meta_num_reqs": int(meta.num_reqs),
+                            "meta_num_actual_tokens": int(meta.num_actual_tokens),
+                            "meta_max_query_len": int(meta.max_query_len),
+                            "meta_max_seq_len": int(meta.max_seq_len),
+                            "cache_req": cache_req,
+                            "cache_tok": cache_tok,
+                            "nsa": nsa,
+                            "valid": valid,
+                            "page": page,
+                        }
+                        topk_payload = None
+                        if (
+                            os.getenv("VLLM_DEBUG_FULL_CG_TOPK", "0") == "1"
+                            and hasattr(self.model, "modules")
+                        ):
+                            for module in self.model.modules():
+                                topk_buffer = getattr(
+                                    module, "topk_indices_buffer", None
+                                )
+                                if isinstance(topk_buffer, torch.Tensor):
+                                    topk_rows = min(
+                                        int(num_tokens_unpadded),
+                                        int(topk_buffer.shape[0]),
+                                        2,
+                                    )
+                                    topk_cols = min(
+                                        int(topk_buffer.shape[1]), 32
+                                    )
+                                    topk_slice = topk_buffer[
+                                        :topk_rows, :topk_cols
+                                    ].detach()
+                                    topk_full = topk_buffer[:topk_rows].detach()
+                                    topk_valid = topk_full[topk_full >= 0]
+                                    topk_payload = {
+                                        "module": type(module).__name__,
+                                        "shape": list(topk_buffer.shape),
+                                        "sample": topk_slice.cpu().tolist(),
+                                        "min": (
+                                            int(topk_valid.min().item())
+                                            if topk_valid.numel()
+                                            else None
+                                        ),
+                                        "max": (
+                                            int(topk_valid.max().item())
+                                            if topk_valid.numel()
+                                            else None
+                                        ),
+                                        "negative": int(
+                                            (topk_slice < 0).sum().item()
+                                        ),
+                                    }
+                                    break
+                        if topk_payload is not None:
+                            payload["topk"] = topk_payload
+                        if (
+                            os.getenv("VLLM_DEBUG_DCP_GRAPH_STATS", "0") == "1"
+                            and hasattr(self.model, "modules")
+                        ):
+                            selected_layers = {
+                                int(x)
+                                for x in os.getenv(
+                                    "VLLM_DEBUG_DCP_GRAPH_LAYERS",
+                                    "0,1,40,77",
+                                ).split(",")
+                                if x.strip()
+                            }
+                            graph_stats = []
+                            for module in self.model.modules():
+                                stats_buffer = getattr(
+                                    module, "_debug_dcp_graph_stats", None
+                                )
+                                if not isinstance(stats_buffer, torch.Tensor):
+                                    continue
+                                layer_name = getattr(module, "layer_name", "")
+                                layer_id = None
+                                marker = "model.layers."
+                                if marker in layer_name:
+                                    tail = layer_name.split(marker, 1)[1]
+                                    try:
+                                        layer_id = int(tail.split(".", 1)[0])
+                                    except ValueError:
+                                        layer_id = None
+                                if layer_id not in selected_layers:
+                                    continue
+                                graph_stats.append(
+                                    {
+                                        "layer": layer_name,
+                                        "stats": stats_buffer.detach()
+                                        .cpu()
+                                        .tolist(),
+                                    }
+                                )
+                            payload["dcp_graph_stats"] = graph_stats
+                    else:
+                        payload = {
+                            "count": debug_count,
+                            "cudagraph_mode": str(cudagraph_mode),
+                            "error": "no page_table_1 metadata found",
+                            "attn_metadata_type": str(type(attn_metadata)),
+                        }
+                    debug_file = os.getenv(
+                        "VLLM_DEBUG_FULL_CG_AFTER_FILE",
+                        "/tmp/vllm_full_cg_after.jsonl",
+                    )
+                    with open(debug_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(payload, sort_keys=True) + "\n")
+                    logger.warning("FULL_CG_AFTER_DEBUG %s", payload)
+                except Exception:
+                    logger.exception("FULL_CG_AFTER_DEBUG failed")
+                setattr(self, "_debug_full_cg_after_count", debug_count + 1)
 
         if _bob_pc:
             _bob_prefill_sync()
@@ -6606,10 +6774,24 @@ class GPUModelRunner(
                     uniform_decode=uniform_decode,
                 )
             )
+            profile_seq_lens = None
+            if cudagraph_runtime_mode == CUDAGraphMode.FULL and uniform_decode:
+                capture_seq_lens = os.getenv(
+                    "VLLM_FULL_DECODE_CG_CAPTURE_SEQ_LENS"
+                )
+                if capture_seq_lens:
+                    profile_seq_lens = int(capture_seq_lens)
+                    logger.warning(
+                        "Capturing FULL uniform decode graph with "
+                        "profile_seq_lens=%d for %s",
+                        profile_seq_lens,
+                        batch_desc,
+                    )
             self._warmup_and_capture(
                 batch_desc,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 allow_microbatching=allow_microbatching,
+                profile_seq_lens=profile_seq_lens,
             )
             torch.accelerator.synchronize()
         self.maybe_remove_all_loras(self.lora_config)

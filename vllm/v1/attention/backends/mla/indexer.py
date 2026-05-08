@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+import json
 import os
 
 import torch
@@ -37,6 +38,16 @@ _SINGLE_REQ_CONTEXT_CACHE: dict[
 ] = {}
 _USE_SGL_KERNEL_FAST_TOPK_TRANSFORM = bool(
     int(os.getenv("VLLM_USE_SGL_KERNEL_FAST_TOPK_TRANSFORM", "0"))
+)
+_DEBUG_INDEXER_BLOCK_WIDTH = os.getenv("VLLM_DEBUG_INDEXER_BLOCK_WIDTH", "0") == "1"
+_DEBUG_INDEXER_BLOCK_WIDTH_FILE = os.getenv(
+    "VLLM_DEBUG_INDEXER_BLOCK_WIDTH_FILE", "/tmp/vllm_indexer_block_width.jsonl"
+)
+_DEBUG_INDEXER_BLOCK_WIDTH_MAX = int(
+    os.getenv("VLLM_DEBUG_INDEXER_BLOCK_WIDTH_MAX", "128")
+)
+_DCP_FULL_INDEXER_STATIC_BLOCK_TABLE_MODE = (
+    os.getenv("VLLM_DCP_FULL_INDEXER_STATIC_BLOCK_TABLE", "auto").strip().lower()
 )
 
 
@@ -549,6 +560,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.cp_kv_cache_interleave_size = (
             self.vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        has_full_cudagraphs = bool(
+            cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
+        )
+        if _DCP_FULL_INDEXER_STATIC_BLOCK_TABLE_MODE in {"1", "true", "yes", "on"}:
+            self.dcp_full_indexer_static_block_table = True
+        elif _DCP_FULL_INDEXER_STATIC_BLOCK_TABLE_MODE in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            self.dcp_full_indexer_static_block_table = False
+        else:
+            # DCP decode under full CUDA graph must keep graph-stable block-table
+            # width. Dynamically narrowing it to the local decode length can make
+            # the sparse MLA indexer feed stale/incorrect page metadata after a
+            # long prefill, corrupting generation.
+            self.dcp_full_indexer_static_block_table = (
+                self.dcp_world_size > 1 and has_full_cudagraphs
+            )
 
         sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
@@ -614,6 +646,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self._single_req_context_cache: tuple[
             int, torch.Tensor, torch.Tensor
         ] | None = None
+        self._debug_indexer_block_width_count = 0
 
     def build_one_prefill_chunk(
         self,
@@ -999,8 +1032,70 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 cdiv(max_decode_seq_len, self.kv_cache_spec.block_size),
                 min_topk_blocks,
             )
-            if block_table.dim() == 2 and block_table.shape[1] > max_decode_blocks:
+            block_table_width_before = (
+                int(block_table.shape[1]) if block_table.dim() == 2 else None
+            )
+            keep_full_block_table = (
+                self.dcp_full_indexer_static_block_table
+                and self.dcp_world_size > 1
+                and block_table.dim() == 2
+            )
+            if (
+                not keep_full_block_table
+                and block_table.dim() == 2
+                and block_table.shape[1] > max_decode_blocks
+            ):
                 block_table = block_table[:, :max_decode_blocks]
+            block_table_width_after = (
+                int(block_table.shape[1]) if block_table.dim() == 2 else None
+            )
+
+            if (
+                _DEBUG_INDEXER_BLOCK_WIDTH
+                and self._debug_indexer_block_width_count
+                < _DEBUG_INDEXER_BLOCK_WIDTH_MAX
+            ):
+                try:
+                    dcp_local_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
+                    dcp_local = (
+                        dcp_local_cpu[:num_decodes].tolist()
+                        if dcp_local_cpu is not None
+                        else None
+                    )
+                    seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_decodes]
+                    payload = {
+                        "count": self._debug_indexer_block_width_count,
+                        "builder": type(self).__name__,
+                        "dcp_world_size": int(self.dcp_world_size),
+                        "dcp_rank": int(self.dcp_rank),
+                        "num_decodes": int(num_decodes),
+                        "num_decode_tokens": int(num_decode_tokens),
+                        "batch_size": int(batch_size),
+                        "max_decode_len": int(max_decode_len),
+                        "max_query_len": int(common_attn_metadata.max_query_len),
+                        "max_seq_len": int(common_attn_metadata.max_seq_len),
+                        "max_model_len": int(self.vllm_config.model_config.max_model_len),
+                        "max_decode_seq_len": int(max_decode_seq_len),
+                        "min_topk_blocks": int(min_topk_blocks),
+                        "max_decode_blocks": int(max_decode_blocks),
+                        "block_table_width_before": block_table_width_before,
+                        "block_table_width_after": block_table_width_after,
+                        "keep_full_block_table": bool(keep_full_block_table),
+                        "seq_lens_cpu": seq_lens_cpu.tolist(),
+                        "dcp_local_seq_lens_cpu": dcp_local,
+                        "requires_padding": bool(requires_padding),
+                        "use_native": bool(use_native),
+                    }
+                    with open(
+                        _DEBUG_INDEXER_BLOCK_WIDTH_FILE,
+                        "a",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write(json.dumps(payload, sort_keys=True) + "\n")
+                    logger.warning("INDEXER_BLOCK_WIDTH_DEBUG %s", payload)
+                except Exception:
+                    logger.exception("INDEXER_BLOCK_WIDTH_DEBUG failed")
+                self._debug_indexer_block_width_count += 1
 
             page_table_1 = None
             cu_seqlens_q = None

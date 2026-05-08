@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -393,6 +394,15 @@ class GroupCoordinator:
         self.use_custom_op_call = (
             current_platform.is_tpu() or current_platform.use_custom_op_collectives()
         )
+        if (
+            self.unique_name.startswith("dcp:")
+            and os.getenv("VLLM_DCP_DISABLE_CUSTOM_OP_COLLECTIVES", "0") == "1"
+        ):
+            logger.warning(
+                "Disabling custom-op collectives for %s by env override",
+                self.unique_name,
+            )
+            self.use_custom_op_call = False
 
         self.use_cpu_custom_send_recv = (
             current_platform.is_cpu()
@@ -539,6 +549,17 @@ class GroupCoordinator:
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        if (
+            self.unique_name.startswith("dcp:")
+            and os.getenv("VLLM_DCP_FORCE_PYNCCL_ALL_GATHER", "0") == "1"
+            and hasattr(self.device_communicator, "all_gatherv")
+        ):
+            if dim < 0:
+                dim += input_.dim()
+            input_dim0 = input_.movedim(dim, 0).contiguous()
+            output_dim0 = self.device_communicator.all_gatherv(input_dim0, dim=0)
+            assert isinstance(output_dim0, torch.Tensor)
+            return output_dim0.movedim(0, dim).contiguous()
         return self.device_communicator.all_gather(input_, dim)
 
     def all_gatherv(
@@ -1298,7 +1319,11 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(get_tp_group().graph_capture(context))
+        stack.enter_context(get_pp_group().graph_capture(context))
+        if _DCP is not None and _DCP.world_size > 1:
+            stack.enter_context(get_dcp_group().graph_capture(context))
         yield context
 
 
