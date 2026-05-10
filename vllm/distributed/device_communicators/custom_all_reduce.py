@@ -256,6 +256,9 @@ class CustomAllreduce:
         self._fused_add_rms_max_rows = 0
         self._fused_add_logged_shapes: set[tuple[str, tuple[int, ...], torch.dtype]] = set()
         self._cpp_ar_cutoff_size: int | None = None
+        self._cpp_ar_ignore_cutoff_max_rows = 0
+        self._cpp_ar_shape_log = False
+        self._cpp_ar_logged_shapes: set[tuple[tuple[int, ...], torch.dtype, str]] = set()
         self._ptr = 0
 
         if not custom_ar:
@@ -473,8 +476,22 @@ class CustomAllreduce:
         self.world_size = world_size
         self.fully_connected = fully_connected
         cpp_ar_cutoff = os.getenv("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF")
-        if cpp_ar_cutoff is not None:
+        if cpp_ar_cutoff:
             self._cpp_ar_cutoff_size = _parse_byte_size(cpp_ar_cutoff)
+        self._cpp_ar_ignore_cutoff_max_rows = int(
+            os.getenv("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "0")
+        )
+        self._cpp_ar_shape_log = _env_flag("VLLM_CPP_AR_SHAPE_LOG")
+        if (
+            self._cpp_ar_cutoff_size is not None
+            and self._cpp_ar_ignore_cutoff_max_rows > 0
+        ):
+            logger.info(
+                "Using dynamic C++ custom allreduce cutoff "
+                "(cutoff=%d bytes, ignore_cutoff_max_rows=%d).",
+                self._cpp_ar_cutoff_size,
+                self._cpp_ar_ignore_cutoff_max_rows,
+            )
         self._ptr = ops.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
@@ -671,19 +688,67 @@ class CustomAllreduce:
         if self._pcie_runtime is not None:
             return self._pcie_runtime.should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
-        if self._cpp_ar_cutoff_size is not None and inp_size > self._cpp_ar_cutoff_size:
+        rows = int(inp.shape[0]) if inp.ndim >= 2 else 1
+        cutoff_applies = not (
+            self._cpp_ar_ignore_cutoff_max_rows > 0
+            and rows <= self._cpp_ar_ignore_cutoff_max_rows
+        )
+        if (
+            cutoff_applies
+            and self._cpp_ar_cutoff_size is not None
+            and inp_size > self._cpp_ar_cutoff_size
+        ):
+            if self._cpp_ar_shape_log:
+                self._log_cpp_ar_shape(inp, rows, inp_size, "nccl_cutoff")
             return False
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
+            if self._cpp_ar_shape_log:
+                self._log_cpp_ar_shape(inp, rows, inp_size, "nccl_unaligned")
             return False
         if not is_weak_contiguous(inp):
+            if self._cpp_ar_shape_log:
+                self._log_cpp_ar_shape(inp, rows, inp_size, "nccl_noncontiguous")
             return False
         # Keep the runtime guard aligned with the initialization contract
         # above. For >2 PCIe GPUs we only use custom allreduce when the
         # topology is explicitly opted in and treated as fully connected.
         if self.world_size == 2 or self.fully_connected:
-            return inp_size < self.max_size
+            use_custom = inp_size < self.max_size
+            if self._cpp_ar_shape_log:
+                self._log_cpp_ar_shape(
+                    inp,
+                    rows,
+                    inp_size,
+                    "custom" if use_custom else "nccl_max_size",
+                )
+            return use_custom
+        if self._cpp_ar_shape_log:
+            self._log_cpp_ar_shape(inp, rows, inp_size, "nccl_topology")
         return False
+
+    def _log_cpp_ar_shape(
+        self,
+        inp: torch.Tensor,
+        rows: int,
+        inp_size: int,
+        decision: str,
+    ) -> None:
+        key = (tuple(inp.shape), inp.dtype, decision)
+        if key in self._cpp_ar_logged_shapes:
+            return
+        self._cpp_ar_logged_shapes.add(key)
+        logger.info(
+            "C++ custom allreduce selector shape=%s dtype=%s rows=%d "
+            "bytes=%d cutoff=%s ignore_cutoff_max_rows=%d decision=%s.",
+            tuple(inp.shape),
+            inp.dtype,
+            rows,
+            inp_size,
+            self._cpp_ar_cutoff_size,
+            self._cpp_ar_ignore_cutoff_max_rows,
+            decision,
+        )
 
     def all_reduce(
         self, inp: torch.Tensor, *, out: torch.Tensor = None, registered: bool = False
