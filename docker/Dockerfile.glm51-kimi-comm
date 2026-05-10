@@ -16,6 +16,10 @@ COPY vllm/v1/attention/backends/mla/triton_mla_tuning.py \
   /opt/vllm/vllm/v1/attention/backends/mla/triton_mla_tuning.py
 COPY vllm/v1/attention/backends/mla/triton_mla_tuning.py \
   /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/triton_mla_tuning.py
+COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py \
+  /opt/vllm/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py \
+  /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
 COPY rtx6k-pcie-fused-allreduce/ /opt/rtx6k-pcie-fused-allreduce/
 COPY scripts/run-glm51-vllm /usr/local/bin/run-glm51-vllm
 COPY scripts/run-kimi26-vllm /usr/local/bin/run-kimi26-vllm

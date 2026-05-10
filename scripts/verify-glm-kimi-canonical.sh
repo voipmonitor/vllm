@@ -7,6 +7,13 @@ glm_mla="$root/vllm/v1/attention/backends/mla/b12x_mla_sparse.py"
 kimi_run="$root/scripts/run-kimi26-vllm"
 glm_run="$root/scripts/run-glm51-vllm"
 
+if [[ ! -f "$kimi_run" && -f /usr/local/bin/run-kimi26-vllm ]]; then
+  kimi_run=/usr/local/bin/run-kimi26-vllm
+fi
+if [[ ! -f "$glm_run" && -f /usr/local/bin/run-glm51-vllm ]]; then
+  glm_run=/usr/local/bin/run-glm51-vllm
+fi
+
 require_file() {
   local path="$1"
   if [[ ! -f "$path" ]]; then
@@ -61,5 +68,10 @@ require_marker "$glm_run" "lukealonso/GLM-5.1-NVFP4-MTP"
 require_sha256 "$glm_mla" "bd59de56a2356ea8cf5b44f54e499f19184ea3c97987a06450e399d5ec7ef8c1"
 require_sha256 "$kimi_run" "4cc0484a6ab7a886aa9d8b82a761936edf4751f6b3fa323d9f988def3879f389"
 require_sha256 "$glm_run" "f63d405ef18a1637bcc4896b7f63c43fa67a2d9c411655549722cd8b32949dcd"
+
+installed_glm_mla="/opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py"
+if [[ -f "$installed_glm_mla" ]]; then
+  require_sha256 "$installed_glm_mla" "bd59de56a2356ea8cf5b44f54e499f19184ea3c97987a06450e399d5ec7ef8c1"
+fi
 
 echo "GLM/Kimi canonical source checks passed."
