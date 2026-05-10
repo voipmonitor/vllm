@@ -19,6 +19,7 @@ COPY vllm/v1/attention/backends/mla/triton_mla_tuning.py \
 COPY rtx6k-pcie-fused-allreduce/ /opt/rtx6k-pcie-fused-allreduce/
 COPY scripts/run-glm51-vllm /usr/local/bin/run-glm51-vllm
 COPY scripts/run-kimi26-vllm /usr/local/bin/run-kimi26-vllm
+COPY scripts/verify-glm-kimi-canonical.sh /usr/local/bin/verify-glm-kimi-canonical
 
 RUN rm -rf \
     /opt/vllm/vllm/distributed/device_communicators/__pycache__ \
@@ -27,7 +28,8 @@ RUN rm -rf \
     /opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/__pycache__ \
     /opt/venv/lib/python3.12/site-packages/vllm/compilation/passes/fusion/__pycache__ \
     /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/__pycache__ \
-  && chmod +x /usr/local/bin/run-glm51-vllm /usr/local/bin/run-kimi26-vllm
+  && chmod +x /usr/local/bin/run-glm51-vllm /usr/local/bin/run-kimi26-vllm /usr/local/bin/verify-glm-kimi-canonical \
+  && /usr/local/bin/verify-glm-kimi-canonical /opt/vllm
 
 ENV NCCL_GRAPH_FILE="" \
     NCCL_P2P_LEVEL=SYS \
@@ -59,6 +61,10 @@ ENV NCCL_GRAPH_FILE="" \
     VLLM_DISABLED_KERNELS=MarlinFP8ScaledMMLinearKernel
 
 LABEL org.opencontainers.image.description="vLLM GLM/Kimi communicator selector image with safe Kimi 2.6 defaults, optional patched NCCL, row-aware cpp AR cutoff, and opt-in RTX6K fused AR experiments" \
+      voipmonitor.vllm.canonical_branch="codex/glm51-kimi-unified-20260510" \
+      voipmonitor.glm.b12x_mla_sparse_sha256="bd59de56a2356ea8cf5b44f54e499f19184ea3c97987a06450e399d5ec7ef8c1" \
+      voipmonitor.kimi.run_kimi26_vllm_sha256="4cc0484a6ab7a886aa9d8b82a761936edf4751f6b3fa323d9f988def3879f389" \
+      voipmonitor.glm.run_glm51_vllm_sha256="f63d405ef18a1637bcc4896b7f63c43fa67a2d9c411655549722cd8b32949dcd" \
       voipmonitor.communicator.base="voipmonitor/vllm:glm51-kimi-main-pciearselect-20260505" \
       voipmonitor.communicator.default="official-nccl+xml+cpp-selector+fusedadd-off" \
       voipmonitor.communicator.custom_all_reduce_sha256="68e768f8f488ea0415dd1be9a9c243144df82862275ba79e9db19a9b67ec2897" \

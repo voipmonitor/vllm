@@ -96,6 +96,75 @@ def _get_b12x_sparse_mla_runner():
     return _run_sparse_mla
 
 
+@triton.jit
+def _b12x_split_decode_final_lse_kernel(
+    tmp_lse_ptr,
+    num_chunks_ptr,
+    out_lse_ptr,
+    tmp_lse_stride_b: tl.constexpr,
+    tmp_lse_stride_h: tl.constexpr,
+    tmp_lse_stride_c: tl.constexpr,
+    out_lse_stride_b: tl.constexpr,
+    out_lse_stride_h: tl.constexpr,
+    max_chunks: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_C)
+    num_chunks = tl.load(num_chunks_ptr)
+    num_chunks = tl.minimum(num_chunks, max_chunks)
+    valid = offs < num_chunks
+    vals = tl.load(
+        tmp_lse_ptr
+        + row * tmp_lse_stride_b
+        + head * tmp_lse_stride_h
+        + offs * tmp_lse_stride_c,
+        mask=valid,
+        other=-float("inf"),
+    )
+    vals = tl.where(vals != vals, -float("inf"), vals)
+    lse_max = tl.max(vals, axis=0)
+    safe_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
+    lse_sum = tl.sum(tl.exp2(vals - safe_max), axis=0)
+    lse_base2 = safe_max + tl.log2(lse_sum)
+    lse_e = tl.where(
+        lse_max == -float("inf"),
+        -float("inf"),
+        lse_base2 * 0.69314718055994530942,
+    )
+    tl.store(out_lse_ptr + row * out_lse_stride_b + head * out_lse_stride_h, lse_e)
+
+
+def _b12x_split_decode_final_lse(
+    tmp_lse: torch.Tensor,
+    num_chunks_ptr: torch.Tensor,
+    *,
+    rows: int,
+    heads: int,
+    max_chunks: int,
+) -> torch.Tensor:
+    out_lse = torch.empty(
+        (rows, heads),
+        dtype=torch.float32,
+        device=tmp_lse.device,
+    )
+    block_c = triton.next_power_of_2(max(1, int(max_chunks)))
+    _b12x_split_decode_final_lse_kernel[(rows, heads)](
+        tmp_lse,
+        num_chunks_ptr,
+        out_lse,
+        tmp_lse.stride(0),
+        tmp_lse.stride(1),
+        tmp_lse.stride(2),
+        out_lse.stride(0),
+        out_lse.stride(1),
+        max_chunks,
+        BLOCK_C=block_c,
+    )
+    return out_lse
+
+
 def _sparse_mla_decode_forward_vllm_metadata(
     *,
     q_all: torch.Tensor,
@@ -131,6 +200,96 @@ def _sparse_mla_decode_forward_vllm_metadata(
         sm_scale=sm_scale,
         v_head_dim=v_head_dim,
     )
+
+
+def _sparse_mla_split_decode_forward_with_lse_vllm_metadata(
+    *,
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    metadata,
+    workspace,
+    sm_scale: float,
+    v_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run B12X sparse split decode and return the final per-rank LSE.
+
+    DCP needs the local attention log-sum-exp to combine outputs across
+    context-parallel ranks. B12X's merge kernel already consumes per-chunk
+    ``tmp_lse`` to normalize the local output, but does not expose the final
+    merged LSE. For CUDA graph replay, reading ``tmp_lse`` after the black-box
+    combined wrapper proved unsafe for DCP. Keep the same B12X split kernels,
+    but make the graph sequence explicit: split forward, final-LSE kernel,
+    then split merge.
+    """
+    from b12x.attention.mla.api import _get_sm_scale_tensor
+    from b12x.attention.mla.split import (
+        run_sparse_mla_split_decode_forward,
+        run_sparse_mla_split_decode_merge,
+    )
+
+    if getattr(workspace, "use_cuda_graph", False):
+        # vLLM owns graph-stable metadata buffers during decode capture.
+        workspace.page_table_1 = metadata.page_table_1
+        workspace.cache_seqlens_int32 = metadata.cache_seqlens_int32
+        workspace.nsa_cache_seqlens_int32 = metadata.nsa_cache_seqlens_int32
+    else:
+        workspace.prepare_decode(
+            metadata.page_table_1,
+            metadata.cache_seqlens_int32,
+            metadata.nsa_cache_seqlens_int32,
+        )
+
+    if workspace.tmp_output is None or workspace.tmp_lse is None:
+        raise RuntimeError("B12X sparse MLA DCP requires split decode buffers")
+    if workspace.kv_chunk_size_ptr is None or workspace.num_chunks_ptr is None:
+        raise RuntimeError("B12X sparse MLA DCP split chunk config is missing")
+
+    output = torch.empty(
+        (q_all.shape[0], q_all.shape[1], v_head_dim),
+        dtype=q_all.dtype,
+        device=q_all.device,
+    )
+    sm_scale_tensor = _get_sm_scale_tensor(
+        workspace=workspace,
+        device=q_all.device,
+        sm_scale=sm_scale,
+    )
+    launch_num_chunks = (
+        int(workspace.max_chunks_per_row)
+        if (workspace.fixed_capacity or workspace.use_cuda_graph)
+        else int(getattr(workspace, "num_chunks_value", 0))
+    )
+    if launch_num_chunks <= 0:
+        raise RuntimeError("B12X sparse MLA DCP split chunk count is invalid")
+
+    run_sparse_mla_split_decode_forward(
+        q_all=q_all,
+        kv_cache=kv_cache,
+        page_table_1=metadata.page_table_1,
+        active_token_counts=metadata.nsa_cache_seqlens_int32,
+        sm_scale=sm_scale_tensor,
+        kv_chunk_size_ptr=workspace.kv_chunk_size_ptr,
+        num_chunks_ptr=workspace.num_chunks_ptr,
+        tmp_output=workspace.tmp_output,
+        tmp_lse=workspace.tmp_lse,
+        launch_num_chunks=launch_num_chunks,
+        workspace=workspace,
+    )
+    lse = _b12x_split_decode_final_lse(
+        workspace.tmp_lse,
+        workspace.num_chunks_ptr,
+        rows=int(q_all.shape[0]),
+        heads=int(q_all.shape[1]),
+        max_chunks=int(workspace.max_chunks_per_row),
+    )
+    run_sparse_mla_split_decode_merge(
+        tmp_output=workspace.tmp_output,
+        tmp_lse=workspace.tmp_lse,
+        num_chunks_ptr=workspace.num_chunks_ptr,
+        output=output,
+        workspace=workspace,
+    )
+    return output, lse
 
 
 def _b12x_sync_debug(stage: str) -> None:
@@ -384,6 +543,21 @@ class B12xMLASparseMetadataBuilder(
     AttentionMetadataBuilder[B12xMLASparseMetadata]
 ):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        del kv_cache_spec
+        dcp_size = int(vllm_config.parallel_config.decode_context_parallel_size)
+        if (
+            dcp_size > 1
+            and os.getenv("VLLM_B12X_MLA_DCP_FORCE_PIECEWISE", "0") == "1"
+        ):
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
 
     def __init__(
         self,
@@ -659,6 +833,25 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.extend_use_cuda_graph = (
             os.getenv("VLLM_B12X_MLA_EXTEND_CUDA_GRAPH", "1") != "0"
         )
+        self.decode_use_cuda_graph = (
+            os.getenv("VLLM_B12X_MLA_DECODE_CUDA_GRAPH", "1") != "0"
+        )
+        self.decode_workspace_per_layer = (
+            os.getenv("VLLM_B12X_MLA_DECODE_WORKSPACE_PER_LAYER", "0") != "0"
+        )
+        self.decode_workspace_ring = _env_int(
+            "VLLM_B12X_MLA_DECODE_WORKSPACE_RING", 1
+        )
+        self.decode_copy_lse = (
+            os.getenv("VLLM_B12X_MLA_DECODE_COPY_LSE", "0") != "0"
+        )
+        self.decode_const_lse = (
+            os.getenv("VLLM_B12X_MLA_DECODE_CONST_LSE", "0") != "0"
+        )
+        self.decode_inline_lse = (
+            os.getenv("VLLM_B12X_MLA_DECODE_INLINE_LSE", "1") != "0"
+        )
+        self._decode_lse_copy_buffer: torch.Tensor | None = None
         # B12X's single-pass sparse MLA kernel does not populate tmp_lse.
         # DCP requires valid LSE for the cross-rank output combine, so extend
         # must keep enough split chunks to make b12x select the split path.
@@ -677,6 +870,21 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             ((max_tokens, num_heads, head_size), torch.bfloat16),
         )
         self._preinstall_b12x_joint_arena()
+
+    def _decode_workspace_layer_key(self, layer_key: str | None) -> str | None:
+        if self.decode_workspace_per_layer:
+            return layer_key
+        if self.decode_workspace_ring <= 1:
+            return None
+        layer_idx = None
+        if layer_key:
+            for part in reversed(layer_key.split(".")):
+                if part.isdigit():
+                    layer_idx = int(part)
+                    break
+        if layer_idx is None:
+            layer_idx = 0
+        return f"ring{layer_idx % self.decode_workspace_ring}"
 
     def _build_b12x_moe_arena_caps(self, device: torch.device, dtype: torch.dtype):
         if not self.use_joint_arena:
@@ -935,11 +1143,99 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     indexer_num_q_heads=self.indexer_num_q_heads,
                     max_page_table_width=topk,
                 )
-                workspace = arena.make_workspace(contract, use_cuda_graph=True)
+                workspace = arena.make_workspace(
+                    contract, use_cuda_graph=self.decode_use_cuda_graph
+                )
                 B12X_WORKSPACES[workspace_key] = workspace
+            self._ensure_decode_split_chunk_config(
+                workspace,
+                page_table_width=topk,
+            )
+            self._ensure_decode_lse_copy_buffer(workspace)
             _prime_b12x_sm_scale(workspace, device, self.scale)
         except (AttributeError, ImportError, RuntimeError, ValueError) as exc:
             logger.warning_once("B12X joint arena preinstall skipped: %s", exc)
+
+    def _ensure_decode_lse_copy_buffer(self, workspace: object) -> torch.Tensor | None:
+        if not self.decode_copy_lse:
+            return None
+        tmp_lse = getattr(workspace, "tmp_lse", None)
+        if tmp_lse is None:
+            return None
+        buffer = self._decode_lse_copy_buffer
+        if (
+            buffer is None
+            or buffer.shape != tmp_lse.shape
+            or buffer.device != tmp_lse.device
+            or buffer.dtype != tmp_lse.dtype
+        ):
+            buffer = torch.empty_like(tmp_lse)
+            self._decode_lse_copy_buffer = buffer
+        return buffer
+
+    def _ensure_decode_split_chunk_config(
+        self,
+        workspace: object,
+        *,
+        page_table_width: int,
+    ) -> None:
+        if getattr(workspace, "tmp_lse", None) is None:
+            return
+        try:
+            from b12x.attention.mla.split import (
+                forced_sparse_mla_split_decode_config_for_width,
+            )
+        except ImportError:
+            return
+        cfg = forced_sparse_mla_split_decode_config_for_width(
+            int(page_table_width),
+            max_chunks=int(getattr(workspace, "max_chunks_per_row", 64)),
+        )
+        if cfg is None:
+            return
+        if (
+            getattr(workspace, "kv_chunk_size_value", None) == int(cfg.chunk_size)
+            and getattr(workspace, "num_chunks_value", None) == int(cfg.num_chunks)
+        ):
+            return
+        workspace.set_decode_chunk_config(
+            kv_chunk_size=int(cfg.chunk_size),
+            num_chunks=int(cfg.num_chunks),
+        )
+
+    def _decode_lse_from_workspace(
+        self,
+        workspace: object,
+        q_all: torch.Tensor,
+    ) -> torch.Tensor:
+        if workspace.tmp_lse is None:
+            raise RuntimeError("B12X sparse MLA DCP requires split-decode LSE")
+        if self.decode_const_lse:
+            return torch.zeros(
+                (q_all.shape[0], q_all.shape[1]),
+                dtype=torch.float32,
+                device=q_all.device,
+            )
+        num_chunks = int(
+            getattr(workspace, "num_chunks_value", 0)
+            or getattr(workspace, "max_chunks_per_row", 0)
+            or workspace.tmp_lse.shape[-1]
+        )
+        num_chunks = max(1, min(num_chunks, int(workspace.tmp_lse.shape[-1])))
+        lse_base2 = workspace.tmp_lse[
+            : q_all.shape[0],
+            : q_all.shape[1],
+            :num_chunks,
+        ]
+        if self.decode_copy_lse:
+            buffer = self._ensure_decode_lse_copy_buffer(workspace)
+            if buffer is not None:
+                lse_copy = buffer[: q_all.shape[0], : q_all.shape[1]]
+                lse_copy.copy_(lse_base2)
+                lse_base2 = lse_copy
+        # B12X split-decode stores per-chunk log-sum-exp in base-2. Convert to
+        # natural-log LSE because the vLLM DCP reducer uses exp/log here.
+        return torch.logsumexp(lse_base2 * math.log(2.0), dim=-1)
 
     def _get_workspace(
         self,
@@ -949,6 +1245,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         *,
         max_kv_rows: int | None = None,
         page_table_width: int | None = None,
+        layer_key: str | None = None,
     ):
         from b12x.integration.mla import (
             B12XAttentionArena,
@@ -1026,10 +1323,16 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             else self.arena_extend_max_batch
         )
         max_page_table_width = max(1, int(page_table_width or topk))
+        workspace_layer_key = (
+            self._decode_workspace_layer_key(layer_key)
+            if mode == "decode"
+            else None
+        )
         key = (
             q.device.type,
             q.device.index,
             mode,
+            workspace_layer_key,
             q.dtype,
             kv_cache.dtype,
             num_q_heads,
@@ -1052,6 +1355,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         )
         workspace = B12X_WORKSPACES.get(key)
         if workspace is not None:
+            if mode == "decode":
+                self._ensure_decode_split_chunk_config(
+                    workspace,
+                    page_table_width=max_page_table_width,
+                )
+                self._ensure_decode_lse_copy_buffer(workspace)
             return workspace
 
         # The B12X arena is needed for CUDA-graph-safe decode workspaces, but a
@@ -1128,10 +1437,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             workspace = arena.make_workspace(
                 contract,
                 use_cuda_graph=(
-                    True if mode == "decode" else self.extend_use_cuda_graph
+                    self.decode_use_cuda_graph
+                    if mode == "decode"
+                    else self.extend_use_cuda_graph
                 ),
             )
             _prime_b12x_sm_scale(workspace, q.device, self.scale)
+            if mode == "decode":
+                self._ensure_decode_split_chunk_config(
+                    workspace,
+                    page_table_width=max_page_table_width,
+                )
+                self._ensure_decode_lse_copy_buffer(workspace)
             B12X_WORKSPACES[key] = workspace
             return workspace
 
@@ -1201,10 +1518,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             max_kv_rows=max_kv_rows,
             page_size=64,
             use_cuda_graph=(
-                True if mode == "decode" else self.extend_use_cuda_graph
+                self.decode_use_cuda_graph
+                if mode == "decode"
+                else self.extend_use_cuda_graph
             ),
         )
         _prime_b12x_sm_scale(workspace, q.device, self.scale)
+        if mode == "decode":
+            self._ensure_decode_split_chunk_config(
+                workspace,
+                page_table_width=max_page_table_width,
+            )
+            self._ensure_decode_lse_copy_buffer(workspace)
         B12X_WORKSPACES[key] = workspace
         return workspace
 
@@ -1406,6 +1731,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 q_all,
                 kv_cache,
                 page_table_width=int(page_table_1.shape[1]),
+                layer_key=getattr(layer, "layer_name", ""),
             )
             metadata = MLASparseDecodeMetadata(
                 page_table_1=page_table_1,
@@ -1430,31 +1756,50 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         nsa_cache_seqlens_int32=nsa_cache_seqlens[row : row + 1],
                         max_seq_len_k=attn_metadata.max_seq_len,
                     )
-                    row_out = _sparse_mla_decode_forward_vllm_metadata(
-                        q_all=q_all[row : row + 1],
-                        kv_cache=kv_cache,
-                        metadata=row_metadata,
-                        workspace=workspace,
-                        sm_scale=self.scale,
-                        v_head_dim=self.kv_lora_rank,
-                    )
-                    out[row : row + 1].copy_(row_out)
-                    if self.need_to_return_lse_for_decode:
-                        if workspace.tmp_lse is None:
-                            raise RuntimeError(
-                                "B12X sparse MLA DCP requires split-decode LSE"
+                    if self.need_to_return_lse_for_decode and self.decode_inline_lse:
+                        row_out, row_lse = (
+                            _sparse_mla_split_decode_forward_with_lse_vllm_metadata(
+                                q_all=q_all[row : row + 1],
+                                kv_cache=kv_cache,
+                                metadata=row_metadata,
+                                workspace=workspace,
+                                sm_scale=self.scale,
+                                v_head_dim=self.kv_lora_rank,
                             )
-                        row_lse = torch.logsumexp(
-                            workspace.tmp_lse[:1, : q_all.shape[1]]
-                            * math.log(2.0),
-                            dim=-1,
                         )
+                    else:
+                        row_out = _sparse_mla_decode_forward_vllm_metadata(
+                            q_all=q_all[row : row + 1],
+                            kv_cache=kv_cache,
+                            metadata=row_metadata,
+                            workspace=workspace,
+                            sm_scale=self.scale,
+                            v_head_dim=self.kv_lora_rank,
+                        )
+                        row_lse = (
+                            self._decode_lse_from_workspace(
+                                workspace, q_all[row : row + 1]
+                            )
+                            if self.need_to_return_lse_for_decode
+                            else None
+                        )
+                    out[row : row + 1].copy_(row_out)
+                    if row_lse is not None:
                         if lse is None:
                             lse = row_lse.new_empty(
                                 (q_all.shape[0], row_lse.shape[1])
                             )
                         lse[row : row + 1].copy_(row_lse)
                 return out, lse
+            if self.need_to_return_lse_for_decode and self.decode_inline_lse:
+                return _sparse_mla_split_decode_forward_with_lse_vllm_metadata(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    metadata=metadata,
+                    workspace=workspace,
+                    sm_scale=self.scale,
+                    v_head_dim=self.kv_lora_rank,
+                )
             out = _sparse_mla_decode_forward_vllm_metadata(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1465,15 +1810,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             )
             if not self.need_to_return_lse_for_decode:
                 return out, None
-            if workspace.tmp_lse is None:
-                raise RuntimeError("B12X sparse MLA DCP requires split-decode LSE")
-            # B12X split-decode stores per-chunk log-sum-exp in base-2. Convert
-            # to natural-log LSE because the vLLM DCP reducer uses exp/log here.
-            lse = torch.logsumexp(
-                workspace.tmp_lse[: q_all.shape[0], : q_all.shape[1]]
-                * math.log(2.0),
-                dim=-1,
-            )
+            lse = self._decode_lse_from_workspace(workspace, q_all)
             return out, lse
 
         from b12x.integration.mla import (
