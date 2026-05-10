@@ -478,9 +478,10 @@ class CustomAllreduce:
         cpp_ar_cutoff = os.getenv("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF")
         if cpp_ar_cutoff:
             self._cpp_ar_cutoff_size = _parse_byte_size(cpp_ar_cutoff)
-        self._cpp_ar_ignore_cutoff_max_rows = int(
-            os.getenv("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "0")
-        )
+        cpp_ar_ignore_rows = os.getenv(
+            "VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "0"
+        ) or "0"
+        self._cpp_ar_ignore_cutoff_max_rows = int(cpp_ar_ignore_rows)
         self._cpp_ar_shape_log = _env_flag("VLLM_CPP_AR_SHAPE_LOG")
         if (
             self._cpp_ar_cutoff_size is not None
