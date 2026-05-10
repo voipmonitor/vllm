@@ -1,0 +1,117 @@
+diff --git a/b12x/attention/mla/api.py b/b12x/attention/mla/api.py
+index f55d44c7f..d15e6a55a 100644
+--- a/b12x/attention/mla/api.py
++++ b/b12x/attention/mla/api.py
+@@ -69,6 +69,13 @@ def _env_flag(name: str) -> bool:
+     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+ 
+ 
++def _workspace_requires_lse(workspace: B12XAttentionWorkspace) -> bool:
++    return bool(
++        getattr(workspace, "requires_lse", False)
++        or getattr(workspace, "_vllm_requires_lse", False)
++    )
++
++
+ def _resolve_mla_prefill_strategy() -> Literal["auto", "single", "split"]:
+     if _env_flag(_MLA_FORCE_SINGLE_PASS_ENV):
+         return "single"
+@@ -104,6 +111,8 @@ def _apply_mla_prefill_strategy(
+         return None
+     if strategy == "split":
+         return split_cfg
++    if _workspace_requires_lse(workspace):
++        return split_cfg
+     if (
+         workspace.mode in ("extend", "verify", "draft_extend")
+         and int(workspace.max_batch) == 1
+@@ -229,7 +238,8 @@ def _run_sparse_mla(
+ 
+     sm_scale_tensor = _get_sm_scale_tensor(workspace=workspace, device=q_all.device, sm_scale=sm_scale)
+     split_cfg = None
+-    force_split = workspace.mode in ("extend", "verify", "draft_extend")
++    requires_lse = _workspace_requires_lse(workspace)
++    force_split = requires_lse or workspace.mode in ("extend", "verify", "draft_extend")
+     graph_stable_split = workspace.fixed_capacity or workspace.use_cuda_graph
+     split_cfg = select_sparse_mla_split_decode_config(
+         q_all=q_all,
+@@ -252,7 +262,11 @@ def _run_sparse_mla(
+         )
+     ):
+         forced_width = int(selected_indices.shape[1])
+-        if active_token_counts is not None and active_token_counts.numel() > 0:
++        if (
++            not requires_lse
++            and active_token_counts is not None
++            and active_token_counts.numel() > 0
++        ):
+             if (
+                 not graph_stable_split
+                 and (
+diff --git a/b12x/attention/nsa_indexer/api.py b/b12x/attention/nsa_indexer/api.py
+index 973233885..a6b1cfe03 100644
+--- a/b12x/attention/nsa_indexer/api.py
++++ b/b12x/attention/nsa_indexer/api.py
+@@ -52,6 +52,10 @@ class NSAIndexerPagedDecodeMetadata:
+     real_page_table: torch.Tensor
+     cache_seqlens_int32: torch.Tensor
+     paged_mqa_schedule_metadata: torch.Tensor | None = None
++    # vLLM's b12x sparse indexer adapter passes this keyword to keep the live
++    # width dynamic inside the kernel. Upstream b12x 0.13 uses
++    # active_width_override instead, so keep this as a compatibility no-op.
++    active_width_hint: int | None = None
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/b12x/integration/tp_moe.py b/b12x/integration/tp_moe.py
+index f69897d60..b34667b19 100644
+--- a/b12x/integration/tp_moe.py
++++ b/b12x/integration/tp_moe.py
+@@ -479,6 +479,17 @@ def clear_tp_moe_caches() -> None:
+ _FAST_MATH_DEFAULT = _env_flag("B12X_FAST_MATH", default=True)
+ 
+ 
++def _tensor_version(t: torch.Tensor) -> int:
++    try:
++        return int(t._version)
++    except RuntimeError:
++        # vLLM runs model weights under torch.inference_mode(); inference
++        # tensors intentionally do not track a version counter. These tensors
++        # are immutable for the lifetime of the serving process, so a stable
++        # sentinel is a valid cache-key component.
++        return 0
++
++
+ def _first_env(*names: str) -> str | None:
+     for name in names:
+         value = os.environ.get(name)
+@@ -603,7 +614,7 @@ def _get_plain_cuda_tensor(t: torch.Tensor, *, dtype: torch.dtype | None = None)
+             tuple(t.stride()),
+             t.dtype,
+             target_dtype,
+-            int(t._version),
++            _tensor_version(t),
+         )
+         cached = _PLAIN_PARAM_CACHE.get(key)
+         if cached is not None:
+@@ -621,7 +632,7 @@ def _tensor_cache_key(t: torch.Tensor) -> Tuple[int, Tuple[int, ...], Tuple[int,
+         tuple(t.shape),
+         tuple(t.stride()),
+         t.dtype,
+-        int(t._version),
++        _tensor_version(t),
+     )
+ 
+ 
+@@ -2810,9 +2821,9 @@ def _get_exact_relu2_bs1_nemotron_launcher(
+         w2_blockscale.data_ptr(),
+         w2_alphas.data_ptr(),
+         a1_gscale.data_ptr(),
+-        int(a1_gscale._version),
++        _tensor_version(a1_gscale),
+         a2_gscale.data_ptr(),
+-        int(a2_gscale._version),
++        _tensor_version(a2_gscale),
+     )
+     last_key, last_launcher = _LAST_EXACT_RELU2_BS1_NEMOTRON
+     if last_key == cache_key:
