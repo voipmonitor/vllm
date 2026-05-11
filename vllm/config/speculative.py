@@ -66,7 +66,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
 ]
-RejectionSampleMethod = Literal["standard", "synthetic"]
+RejectionSampleMethod = Literal["standard", "probabilistic", "synthetic"]
 DraftSampleMethod = Literal["greedy", "gumbel"]
 
 
@@ -265,6 +265,15 @@ class SpeculativeConfig:
     draft logits are used for the probability ratio test during rejection
     sampling. This comes at the cost of additional GPU memory usage. This
     parameter currently only applies to Model Runner V2."""
+
+    @field_validator("rejection_sample_method", mode="before")
+    @classmethod
+    def _parse_rejection_sample_method(cls, value: Any) -> Any:
+        # Older Kimi/GLM launch recipes used "probabilistic" for what upstream
+        # now calls "standard" rejection sampling.
+        if value == "probabilistic":
+            return "standard"
+        return value
 
     def compute_hash(self) -> str:
         """
