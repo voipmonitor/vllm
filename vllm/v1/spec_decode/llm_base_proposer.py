@@ -1157,7 +1157,14 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
-        base = self.vllm_config
+        base = replace(
+            self.vllm_config,
+            parallel_config=replace(
+                spec_cfg.draft_parallel_config,
+                rank=self.vllm_config.parallel_config.rank,
+            ),
+            model_config=spec_cfg.draft_model_config,
+        )
 
         if spec_cfg.moe_backend is not None:
             base = replace(
@@ -1168,6 +1175,19 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
+        if spec_cfg.draft_kv_cache_dtype is not None:
+            base = replace(
+                base,
+                cache_config=replace(
+                    base.cache_config,
+                    cache_dtype=spec_cfg.draft_kv_cache_dtype,
+                ),
+            )
+
+        draft_backend = spec_cfg.draft_attention_backend
+        if draft_backend is None:
+            draft_backend = spec_cfg.attention_backend
+
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
@@ -1175,7 +1195,7 @@ class SpecDecodeBaseProposer:
             base,
             attention_config=replace(
                 base.attention_config,
-                backend=spec_cfg.attention_backend,
+                backend=draft_backend,
             ),
         )
 
