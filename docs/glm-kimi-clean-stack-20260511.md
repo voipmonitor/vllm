@@ -245,6 +245,59 @@ Use this order so each commit is reviewable and rebaseable.
     - external `b12x` version/source
     - final Docker labels that identify exact git commits
 
+## External B12X Branch
+
+The vLLM branch is not self-contained. The latest verified GLM A16 runtime also
+depends on external `b12x` changes.
+
+Canonical external B12X branch:
+
+```text
+https://github.com/local-inference-lab/b12x/tree/codex/glm51-kimi-b12x-a16-cpuhangfix-20260511
+```
+
+Base:
+
+```text
+local-inference-lab/b12x@3917cb2fe5a2118eaab8b68f7710c71aad9e4b1c
+```
+
+Current head:
+
+```text
+9f6a0248497d9bd920338a3c1a20be9f62d1ffe7
+```
+
+Topic commits:
+
+| Commit | Topic |
+| --- | --- |
+| `65a44db` | Keep sparse MLA split selection stable when vLLM/DCP requires LSE |
+| `474fc60` | Reuse NSA indexer TMA descriptors from the B12X workspace instead of rebuilding them on the hot path |
+| `5578ec5` | Make TP MoE cache keys safe under `torch.inference_mode()` and disable eager exact dynamic workspace by default |
+| `9f6a024` | Restore the PCIe oneshot completion barrier used by the verified Docker images |
+
+This branch matches the `site-b12x` tree from
+`voipmonitor/vllm:glm51-b12x-a16-padfix-cpuhangfix-20260511` after excluding
+`__pycache__` and `.pyc` files.
+
+Do not build the final common Docker from plain upstream `b12x@3917cb2`; it
+misses the DCP/LSE behavior, NSA indexer CPU-sync reduction, A16 MoE stability
+fixes, and the PCIe oneshot completion barrier.
+
+CPU/GPU sync audit notes for this branch:
+
+- Sparse MLA width shrink still has an `.item()` fallback only when the call is
+  not graph-stable and LSE is not required. The vLLM DCP/LSE path keeps static
+  width and does not use that sync.
+- NSA page-id validation has `.item()` reads only behind
+  `B12X_NSA_VALIDATE_PAGE_IDS=1`, which is off by default.
+- NSA tiled top-k `torch.cuda.synchronize()` is in explicit prewarm code, not in
+  serving hot path.
+- TP MoE exact dynamic workspace sizing remains opt-in through
+  `B12X_MOE_EAGER_EXACT_DYNAMIC=1`; default runtime avoids that routing-derived
+  D2H sizing path.
+
 ## Hard Rules
 
 - Do not copy entire source files from Docker snapshots into the clean branch.
