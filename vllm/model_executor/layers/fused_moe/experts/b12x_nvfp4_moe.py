@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
@@ -24,6 +27,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
+logger = init_logger(__name__)
+
 
 def _import_b12x_tp_moe():
     try:
@@ -32,11 +37,113 @@ def _import_b12x_tp_moe():
         return None
 
 
+_B12X_PAD_M_TO_POW2 = envs.VLLM_B12X_PAD_M_TO_POW2
+_B12X_MOE_STATIC_CHUNK_TOKENS = int(
+    os.getenv("VLLM_B12X_MOE_STATIC_CHUNK_TOKENS", "0")
+)
+_B12X_MOE_STATIC_CHUNK_MAX_M = int(
+    os.getenv("VLLM_B12X_MOE_STATIC_CHUNK_MAX_M", "0")
+)
+_B12X_MOE_PAD_MIN_M = int(os.getenv("B12X_MOE_PAD_MIN_M", "512"))
 _B12X_MOE_WORKSPACE_POOLS: dict[int, Any] = {}
+
+try:
+    from b12x.integration import (
+        get_b12x_moe_workspace_pool as _b12x_shared_arena_pool,
+    )
+except ImportError:
+    _b12x_shared_arena_pool = None
+
+
+def _next_pow2_ge(n: int) -> int:
+    if n < 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _b12x_moe_fp4_pad_m(
+    *,
+    runner: Any,
+    a: torch.Tensor,
+    output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    **kwargs: Any,
+) -> None:
+    """Fold prefill tail shapes into pre-warmed B12X MoE M buckets."""
+    m = a.shape[0]
+    if (
+        _B12X_MOE_STATIC_CHUNK_TOKENS > 0
+        and m > _B12X_MOE_STATIC_CHUNK_TOKENS
+        and (
+            _B12X_MOE_STATIC_CHUNK_MAX_M <= 0
+            or m <= _B12X_MOE_STATIC_CHUNK_MAX_M
+        )
+    ):
+        chunk = _B12X_MOE_STATIC_CHUNK_TOKENS
+        for start in range(0, m, chunk):
+            end = min(start + chunk, m)
+            _b12x_moe_fp4_pad_m(
+                runner=runner,
+                a=a[start:end],
+                output=output[start:end],
+                topk_weights=topk_weights[start:end],
+                topk_ids=topk_ids[start:end],
+                **kwargs,
+            )
+        return
+
+    if not _B12X_PAD_M_TO_POW2 or m <= 1 or m < _B12X_MOE_PAD_MIN_M:
+        runner(
+            a=a,
+            output=output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            **kwargs,
+        )
+        return
+
+    m_padded = _next_pow2_ge(m)
+    if m_padded == m:
+        runner(
+            a=a,
+            output=output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            **kwargs,
+        )
+        return
+
+    pad_n = m_padded - m
+    a_p = torch.nn.functional.pad(a, (0, 0, 0, pad_n))
+    topk_weights_p = torch.nn.functional.pad(topk_weights, (0, 0, 0, pad_n))
+    topk_ids_p = torch.nn.functional.pad(topk_ids, (0, 0, 0, pad_n), value=0)
+    output_p = torch.empty(
+        (m_padded,) + tuple(output.shape[1:]),
+        dtype=output.dtype,
+        device=output.device,
+    )
+
+    runner(
+        a=a_p,
+        output=output_p,
+        topk_weights=topk_weights_p,
+        topk_ids=topk_ids_p,
+        **kwargs,
+    )
+    output.copy_(output_p[:m])
 
 
 def _get_b12x_workspace_pool(device: torch.device) -> Any:
     """Return a lazily created per-device workspace pool for the B12X MoE kernel."""
+    if _b12x_shared_arena_pool is not None:
+        try:
+            return _b12x_shared_arena_pool(device)
+        except (AttributeError, RuntimeError) as exc:
+            logger.warning_once(
+                "Falling back to standalone b12x MoE workspace pool: %s", exc
+            )
+
     device_idx = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
@@ -170,18 +277,20 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
-        self._b12x_moe_fp4(
-            hidden_states,
-            self.a1_gscale,
-            w1,
-            self.w1_scale,
-            self.g1_alphas,
-            self.a2_gscale,
-            w2,
-            self.w2_scale,
-            self.g2_alphas,
-            topk_weights,
-            topk_ids,
+        _b12x_moe_fp4_pad_m(
+            runner=self._b12x_moe_fp4,
+            a=hidden_states,
+            a1_gscale=self.a1_gscale,
+            w1_fp4=w1,
+            w1_blockscale=self.w1_scale,
+            w1_alphas=self.g1_alphas,
+            a2_gscale=self.a2_gscale,
+            w2_fp4=w2,
+            w2_blockscale=self.w2_scale,
+            w2_alphas=self.g2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            apply_router_weight_on_input=False,
             workspace=_get_b12x_workspace_pool(hidden_states.device),
             output=output,
             input_scales_are_reciprocal=True,
