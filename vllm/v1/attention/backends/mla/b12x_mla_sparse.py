@@ -17,7 +17,6 @@ import os
 import time
 from typing import TYPE_CHECKING, ClassVar
 
-import numpy as np
 import torch
 
 from vllm.distributed.parallel_state import get_dcp_group
@@ -73,7 +72,6 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     SparseMLAAttentionImpl,
 )
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -85,6 +83,82 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _B12X_SYNC_DEBUG = os.getenv("VLLM_B12X_SYNC_DEBUG", "0") != "0"
+
+
+@triton.jit
+def _build_b12x_token_metadata_kernel(
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    req_id_per_token_ptr,
+    cache_seq_lens_per_token_ptr,
+    num_tokens: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    cp_kv_cache_interleave_size: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    req_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offs = block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+
+    start = tl.load(query_start_loc_ptr + req_id)
+    end = tl.load(query_start_loc_ptr + req_id + 1)
+    query_len = end - start
+    token_idx = start + offs
+    valid = (offs < query_len) & (token_idx < num_tokens)
+
+    # vLLM seq_lens is the sequence length after adding this query. B12X needs
+    # the per-query-row sequence length, so walk backward by query_len.
+    global_seq_len = tl.load(seq_lens_ptr + req_id)
+    per_token_global_len = global_seq_len - query_len + offs + 1
+
+    if dcp_size == 1:
+        per_token_len = per_token_global_len
+    else:
+        interleave = cp_kv_cache_interleave_size
+        base = (per_token_global_len // interleave // dcp_size) * interleave
+        remainder = per_token_global_len - base * dcp_size
+        remainder = tl.minimum(
+            tl.maximum(remainder - dcp_rank * interleave, 0), interleave
+        )
+        per_token_len = base + remainder
+
+    tl.store(req_id_per_token_ptr + token_idx, req_id, mask=valid)
+    tl.store(cache_seq_lens_per_token_ptr + token_idx, per_token_len, mask=valid)
+
+
+def _build_b12x_token_metadata(
+    *,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_id_per_token: torch.Tensor,
+    cache_seq_lens_per_token: torch.Tensor,
+    num_reqs: int,
+    num_tokens: int,
+    max_query_len: int,
+    dcp_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> None:
+    req_id_per_token[:num_tokens].zero_()
+    cache_seq_lens_per_token[:num_tokens].zero_()
+    if num_reqs <= 0 or num_tokens <= 0 or max_query_len <= 0:
+        return
+
+    block_m = min(1024, triton.next_power_of_2(max(1, int(max_query_len))))
+    _build_b12x_token_metadata_kernel[
+        (num_reqs, triton.cdiv(int(max_query_len), block_m))
+    ](
+        query_start_loc,
+        seq_lens,
+        req_id_per_token,
+        cache_seq_lens_per_token,
+        num_tokens,
+        int(dcp_size),
+        int(dcp_rank),
+        int(cp_kv_cache_interleave_size),
+        BLOCK_M=block_m,
+    )
 
 
 @functools.cache
@@ -632,71 +706,22 @@ class B12xMLASparseMetadataBuilder(
                 seq_lens[: cm.num_reqs], non_blocking=True
             )
         else:
-            starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-            query_lens = np.diff(starts)
-            num_query_tokens = int(starts[-1])
-            if num_query_tokens > num_tokens:
-                raise RuntimeError(
-                    "B12X sparse MLA metadata received query_start_loc with "
-                    f"{num_query_tokens} tokens, exceeding padded capacity "
-                    f"{num_tokens}"
-                )
-            req_ids = np.zeros((num_tokens,), dtype=np.int32)
-            if num_query_tokens:
-                req_ids[:num_query_tokens] = np.repeat(
-                    np.arange(cm.num_reqs, dtype=np.int32), query_lens
-                )
-
             seq_lens_for_req = (
                 cm.dcp_local_seq_lens
                 if cm.dcp_local_seq_lens is not None
                 else cm.seq_lens
             )
-            seq_lens_cpu = cm.seq_lens_cpu.numpy().astype(np.int32, copy=False)
-            # `cm.num_actual_tokens` can be CUDA-graph padded. query_start_loc
-            # still describes only real query rows, so fill padding rows with
-            # zero-length metadata instead of trying to copy a shorter req-id
-            # vector into the padded buffer.
-            per_token_lens = np.zeros((num_tokens,), dtype=np.int32)
-            for req_id, q_len in enumerate(query_lens):
-                if q_len <= 0:
-                    continue
-                start = int(starts[req_id])
-                end = int(starts[req_id + 1])
-                context_len = int(seq_lens_cpu[req_id]) - int(q_len)
-                global_per_token_lens = torch.arange(
-                    context_len + 1, context_len + int(q_len) + 1, dtype=torch.int32
-                )
-                if cm.dcp_local_seq_lens is not None:
-                    per_token_lens[start:end] = get_dcp_local_seq_lens(
-                        global_per_token_lens,
-                        self.dcp_world_size,
-                        self.dcp_rank,
-                        self.cp_kv_cache_interleave_size,
-                    ).numpy()
-                else:
-                    per_token_lens[start:end] = global_per_token_lens.numpy()
-
-            # Pin the host source tensors so non_blocking=True copies are
-            # legal during CUDA graph capture. Without `.pin_memory()`,
-            # capturing a forward pass through this branch (max_query_len>1
-            # path, e.g. MTP=3 decode where max_query_len=4) raises:
-            #   "Cannot copy between CPU and CUDA tensors during CUDA graph
-            #    capture unless the CPU tensor is pinned."
-            # The buffers themselves are CUDA (allocated at line 245-247
-            # with device=device), so the copy_ direction is CPU→CUDA;
-            # pinning the source side satisfies the capture-time constraint.
-            req_ids_t = torch.from_numpy(req_ids)
-            per_token_lens_t = torch.from_numpy(per_token_lens)
-            if req_ids_t.device.type == "cpu":
-                req_ids_t = req_ids_t.pin_memory()
-            if per_token_lens_t.device.type == "cpu":
-                per_token_lens_t = per_token_lens_t.pin_memory()
-            self.req_id_per_token_buffer[:num_tokens].copy_(
-                req_ids_t, non_blocking=True
-            )
-            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
-                per_token_lens_t, non_blocking=True
+            _build_b12x_token_metadata(
+                query_start_loc=cm.query_start_loc,
+                seq_lens=cm.seq_lens,
+                req_id_per_token=self.req_id_per_token_buffer,
+                cache_seq_lens_per_token=self.cache_seq_lens_per_token_buffer,
+                num_reqs=cm.num_reqs,
+                num_tokens=num_tokens,
+                max_query_len=cm.max_query_len,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
             self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
                 seq_lens_for_req[: cm.num_reqs], non_blocking=True
