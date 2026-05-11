@@ -1377,6 +1377,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     # - VARLEN: Supports variable-length queries (spec decode with mixed lengths)
     # If set to UNIFORM or VARLEN, this will increase `reorder_batch_threshold` when
     # speculative decoding is enabled.
+    supports_update_for_drafting: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
 
     # The threshold for reordering the batch into decode and prefill requests.
@@ -1579,6 +1580,79 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         assert m.max_query_len <= self.reorder_batch_threshold  # decode only
 
         return self.build(0, m)
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> M:
+        """Build draft metadata without decode-context-parallel fields.
+
+        MTP draft layers own a separate local KV cache and must not inherit
+        target-model DCP tensor shapes.
+        """
+        if self.dcp_world_size > 1:
+            saved = self.dcp_world_size
+            self.dcp_world_size = 1
+            try:
+                return self.build(0, common_attn_metadata, fast_build=True)
+            finally:
+                self.dcp_world_size = saved
+        return self.build(0, common_attn_metadata, fast_build=True)
+
+    def update_for_drafting(
+        self,
+        attn_metadata: M,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> M:
+        if self.dcp_world_size > 1:
+            saved = self.dcp_world_size
+            self.dcp_world_size = 1
+            try:
+                return self.update_for_drafting(
+                    attn_metadata, common_attn_metadata, draft_index
+                )
+            finally:
+                self.dcp_world_size = saved
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        max_seq_len = common_attn_metadata.max_seq_len
+        seq_lens = common_attn_metadata.seq_lens
+
+        num_decodes, num_prefills, num_decode_tokens, _ = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+            )
+        )
+
+        if num_prefills > 0:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        attn_metadata.num_reqs = num_reqs
+        attn_metadata.max_query_len = common_attn_metadata.max_query_len
+        attn_metadata.max_seq_len = max_seq_len
+        attn_metadata.num_actual_tokens = num_tokens
+        attn_metadata.query_start_loc = common_attn_metadata.query_start_loc
+        attn_metadata.seq_lens = seq_lens
+        attn_metadata.slot_mapping = common_attn_metadata.slot_mapping
+        attn_metadata.num_decodes = num_decodes
+        attn_metadata.num_decode_tokens = num_decode_tokens
+        attn_metadata.num_prefills = num_prefills
+        attn_metadata.prefill = None
+
+        decode = attn_metadata.decode
+        if decode is None:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        decode.block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+        decode.seq_lens = seq_lens[:num_decodes]
+        decode.dcp_tot_seq_lens = None
+
+        return attn_metadata
 
     def build(
         self,

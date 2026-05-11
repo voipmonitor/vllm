@@ -230,6 +230,7 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
 
 
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+    supports_update_for_drafting = True
     reorder_batch_threshold: int = 1
     natively_supported_next_n_fp4: list[int] = [1, 2]
     # TODO (matt): integrate kernel with next_n = 4 support
@@ -637,6 +638,117 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill=prefill_metadata,
             decode=decode_metadata,
         )
+
+        return attn_metadata
+
+    def update_for_drafting(
+        self,
+        attn_metadata: DeepseekV32IndexerMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> DeepseekV32IndexerMetadata:
+        num_tokens = common_attn_metadata.num_actual_tokens
+        query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        seq_lens = common_attn_metadata.seq_lens
+        slot_mapping = common_attn_metadata.slot_mapping
+        block_table = common_attn_metadata.block_table_tensor
+
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=not self.use_flattening,
+            )
+        )
+
+        if num_prefills > 0 or num_decodes == 0:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        compressed_slot_mapping = slot_mapping
+        if self.compress_ratio > 1:
+            compressed_slot_mapping = get_compressed_slot_mapping(
+                num_tokens,
+                query_start_loc,
+                seq_lens,
+                block_table,
+                self.kv_cache_spec.storage_block_size,
+                self.compress_ratio,
+                out=self.compressed_slot_mapping_buffer,
+            )
+
+        decode = attn_metadata.decode
+        if decode is None:
+            return self.build_for_drafting(common_attn_metadata, draft_index)
+
+        torch.diff(
+            common_attn_metadata.query_start_loc[: num_decodes + 1],
+            out=self.decode_lens_buffer[:num_decodes],
+        )
+        decode_lens = self.decode_lens_buffer[:num_decodes]
+        decode_lens_cpu = torch.diff(query_start_loc_cpu[: num_decodes + 1])
+
+        decode_seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+        decode_block_table = common_attn_metadata.block_table_tensor[
+            :num_decodes, ...
+        ]
+
+        max_decode_len = int(decode_lens_cpu.max().item())
+        next_n = 1 + self.num_speculative_tokens
+        use_native = not self.use_flattening and max_decode_len <= next_n
+
+        decode_seq_lens, decode_block_table, decode_lens, _, requires_padding = (
+            self._prepare_decode_tensors(
+                seq_lens=decode_seq_lens,
+                block_table=decode_block_table,
+                decode_lens=decode_lens,
+                decode_lens_cpu=decode_lens_cpu,
+                query_start_loc=query_start_loc[:num_decodes],
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                use_native=use_native,
+                next_n=next_n,
+                max_decode_len=max_decode_len,
+            )
+        )
+
+        if self.compress_ratio > 1:
+            seq_lens_is_local_view = (use_native and next_n > 1) or (
+                not use_native and max_decode_len > 1
+            )
+            if seq_lens_is_local_view:
+                decode_seq_lens //= self.compress_ratio
+            else:
+                self.expanded_seq_lens_buffer[:num_decodes] = (
+                    decode_seq_lens // self.compress_ratio
+                )
+                self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
+                decode_seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+
+        if decode_seq_lens.dim() == 1:
+            decode_seq_lens = decode_seq_lens.unsqueeze(-1)
+
+        if current_platform.is_cuda() and has_deep_gemm():
+            self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+                decode_seq_lens,
+                self.kv_cache_spec.storage_block_size,
+                self.num_sms,
+            )
+
+        attn_metadata.seq_lens = common_attn_metadata.seq_lens
+        attn_metadata.max_seq_len = common_attn_metadata.max_seq_len
+        attn_metadata.slot_mapping = compressed_slot_mapping
+        attn_metadata.num_decodes = num_decodes
+        attn_metadata.num_decode_tokens = num_decode_tokens
+        attn_metadata.num_prefills = num_prefills
+        attn_metadata.num_prefill_tokens = num_prefill_tokens
+        attn_metadata.prefill = None
+
+        decode.block_table = decode_block_table
+        decode.seq_lens = decode_seq_lens
+        decode.decode_lens = decode_lens
+        decode.requires_padding = requires_padding
+        decode.schedule_metadata = self.scheduler_metadata_buffer
 
         return attn_metadata
 
