@@ -81,12 +81,12 @@ reconstruction path. The important upstream PR roots are:
 
 | PR | Topic | Status for this reconstruction |
 | --- | --- | --- |
-| `#40609` | MLA plus DCP plus FP8 KV cache support | Port or verify present before Kimi DCP/F8 tests |
-| `#40610` | Async proposer synchronization | Port or verify present before async MTP tests |
-| `#40611` | Draft-specific attention backend and draft KV dtype | Port for Kimi target/draft backend split |
-| `#40654` | Avoid `seq_lens_cpu` GPU-to-CPU sync | Already present in current `upstream/main`; keep verifier coverage |
-| `#40750` | Consolidated TRITON_MLA full CUDA graph Kimi MTP stack | Use as the primary source for Kimi TRITON_MLA hunks |
-| `#40895` | Export parallel/DCP config in metrics | Optional but useful for KV-budget observability |
+| `#40609` | MLA plus DCP plus FP8 KV cache support | Ported as `attention: support MLA DCP with fp8 KV cache` |
+| `#40610` | Async proposer synchronization | Ported as `spec-decode: synchronize async proposer work` |
+| `#40611` | Draft-specific attention backend and draft KV dtype | Ported as `spec-decode: isolate draft backend and cache config` |
+| `#40654` | Avoid `seq_lens_cpu` GPU-to-CPU sync | Already present in current `upstream/main`; do not duplicate older local experiments |
+| `#40750` | Consolidated TRITON_MLA full CUDA graph Kimi MTP stack | Ported as `attention: enable TRITON_MLA full graph decode tuning` |
+| `#40895` | Export parallel/DCP config in metrics | Ported as `metrics: export parallel config info` |
 
 Superseded Kimi items:
 
@@ -232,9 +232,8 @@ Use this order so each commit is reviewable and rebaseable.
 
 12. `metrics-and-observability`
 
-    Port `#40895` if it is not already upstream by the time this branch is
-    rebuilt. This is not a speed path, but it prevents KV-budget/DCP confusion
-    in future benchmark tooling.
+    Ported from `#40895`. This is not a speed path, but it prevents
+    KV-budget/DCP confusion in future benchmark tooling.
 
 13. `build-runtime`
 
@@ -259,10 +258,10 @@ Use this order so each commit is reviewable and rebaseable.
 
 1. Tree attention/spec-decode stack:
 
-   Verified images contain `tree_attn.py`, but current upstream removed it.
-   Decide whether to keep it as an explicit backport for the verified MTP path
-   or port our Kimi/GLM spec-decode changes onto the newer upstream path without
-   tree attention.
+   Verified images contain `tree_attn.py`, but current upstream no longer uses
+   that path. The clean branch keeps the newer upstream spec-decode path and
+   does not backport `TREE_ATTN` unless a concrete runtime test proves it is
+   still required.
 
 2. B12X sparse MLA ownership:
 
