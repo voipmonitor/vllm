@@ -298,6 +298,69 @@ CPU/GPU sync audit notes for this branch:
   `B12X_MOE_EAGER_EXACT_DYNAMIC=1`; default runtime avoids that routing-derived
   D2H sizing path.
 
+## GLM rtx6kpro Audit
+
+The following GLM documentation was audited against this branch and the external
+B12X branch:
+
+```text
+https://github.com/local-inference-lab/rtx6kpro/tree/master/models/glm5.1
+https://github.com/local-inference-lab/rtx6kpro/blob/master/models/glm5.md
+```
+
+Findings that are already captured by this clean stack:
+
+- `B12X_MLA_SPARSE` is the required GLM attention path. The dense MLA
+  comparison from `2026-04-20` is quality evidence against replacing NSA/sparse
+  MLA with dense MLA as a workaround.
+- GLM DCP correctness depends on returning valid LSE from the B12X sparse MLA
+  split path. This is covered by the vLLM sparse MLA integration plus the
+  external B12X LSE/split commits.
+- The historical vanilla `b12x==0.11.1` overlay had three important runtime
+  deltas: NSA indexer CPU-sync reduction, tiled top-k dynamic layout keys, and
+  the PCIe oneshot completion barrier. The current external B12X branch carries
+  the equivalent behavior on top of newer B12X.
+- Patched NCCL PR `#2127` is a Docker/build contract, not a vLLM source patch.
+  The final image must expose `/opt/libnccl-pr2127.so.2.30.3`, set
+  `VLLM_NCCL_SO_PATH` or `LD_PRELOAD`, use `NCCL_PROTO=LL,LL128,Simple`, and
+  unset `NCCL_GRAPH_FILE` for the no-XML path.
+- GLM MTP uses `use_local_argmax_reduction=true`; this is present in the
+  current speculative config and proposer code.
+- The old `VLLM_MTP_RETURN_NORMALIZED_HIDDEN=1` launcher env has become
+  redundant in this branch: `DeepSeekMultiTokenPredictorLayer.forward()` now
+  returns `self.shared_head(hidden_states)` unconditionally, and logits/top-token
+  paths consume the normalized hidden state directly.
+- RTX6K fused allreduce/add/RMS remains experimental. The documented GLM result
+  says no-end-barrier fused add corrupted GLM MTP hidden states, while the
+  end-barrier variant was correct but slower at high concurrency. The safe
+  default remains `VLLM_RTX6K_FUSED_ALLREDUCE_ADD=0`.
+- For DCP greater than 1, GLM docs consistently show
+  `VLLM_ENABLE_PCIE_ALLREDUCE=0` as the default unless a new per-shape selector
+  proves otherwise. DCP1 can use the C++ PCIe allreduce selector.
+- The correct GLM `index_topk_pattern` has no extra trailing `F`:
+  `FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS`.
+
+Items that still need an explicit decision before final release:
+
+- `VLLM_SPEC_ACCEPT_THRESHOLD_ACC` and `VLLM_SPEC_ACCEPT_THRESHOLD_SINGLE` are
+  documented in the older GLM pages, but the current branch does not implement
+  those env variables. The old backport used them as a throughput/quality
+  experiment in `vllm/v1/sample/rejection_sampler.py`. Do not keep exporting
+  these envs as if they work; either remove them from launchers or re-port them
+  intentionally as an opt-in non-distribution-preserving mode.
+- `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1` appears in the 2026-05-02 GLM vLLM
+  command. The env still exists in vLLM, but later GLM docs do not consistently
+  require it. Treat it as an A/B launch knob, not as an assumed source patch.
+- The 2026-05-02 report says B12X MoE and attention/indexer paths were prewarmed
+  for common M values up to `8192`. The current vLLM branch folds MoE M shapes
+  into stable buckets through `VLLM_B12X_MOE_STATIC_CHUNK_TOKENS` and the B12X
+  branch has explicit NSA tiled top-k prewarm code, but the final Docker launch
+  still needs a startup check that first real long prefill does not trigger CUTE
+  recompilation.
+- The SGLang-only patches under
+  `compare-dense-mla-vs-nsa-benchmark-2026-04-20/patches` are not vLLM source
+  patches. They should only be revisited if we build a SGLang image again.
+
 ## Hard Rules
 
 - Do not copy entire source files from Docker snapshots into the clean branch.
