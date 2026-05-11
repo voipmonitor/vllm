@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
 import typing
 from collections.abc import Callable, Iterable
 from copy import copy
 
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from transformers import PretrainedConfig
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.config.utils import replace
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -19,6 +21,10 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    scaled_dequantize,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -42,22 +48,236 @@ from .utils import get_draft_quant_config, maybe_prefix
 logger = init_logger(__name__)
 
 
+def _resolve_cached_hf_model_path(model_path: str | None) -> str | None:
+    if not model_path or os.path.isdir(model_path):
+        return model_path
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_index = try_to_load_from_cache(
+            model_path, "model.safetensors.index.json"
+        )
+        if isinstance(cached_index, str):
+            return os.path.dirname(cached_index)
+    except Exception:
+        return None
+    return None
+
+
+def _get_local_model_path(config: PretrainedConfig, vllm_config: VllmConfig) -> str | None:
+    for attr in ("_name_or_path", "name_or_path"):
+        model_path = getattr(config, attr, None)
+        resolved_model_path = _resolve_cached_hf_model_path(model_path)
+        if resolved_model_path:
+            return resolved_model_path
+
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    for model_path in (
+        getattr(draft_model_config, "model", None),
+        getattr(draft_model_config, "model_path", None),
+        getattr(model_config, "model", None),
+        getattr(model_config, "model_path", None),
+    ):
+        resolved_model_path = _resolve_cached_hf_model_path(model_path)
+        if resolved_model_path:
+            return resolved_model_path
+    return None
+
+
+def _has_serialized_modelopt_fp4_nextn_experts(
+    config: PretrainedConfig, vllm_config: VllmConfig
+) -> bool:
+    model_path = _get_local_model_path(config, vllm_config)
+    if model_path is None:
+        return False
+
+    nextn_layer_id = getattr(config, "num_hidden_layers", None)
+    if nextn_layer_id is None:
+        return False
+
+    probe_prefix = f"model.layers.{nextn_layer_id}.mlp.experts.0.down_proj"
+    probe_weight = f"{probe_prefix}.weight"
+    required_keys = {
+        probe_weight,
+        f"{probe_prefix}.weight_scale",
+        f"{probe_prefix}.weight_scale_2",
+        f"{probe_prefix}.input_scale",
+    }
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    single_shard_path = os.path.join(model_path, "model.safetensors")
+
+    try:
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            if not required_keys.issubset(weight_map):
+                return False
+            shard_path = os.path.join(model_path, weight_map[probe_weight])
+        elif os.path.exists(single_shard_path):
+            shard_path = single_shard_path
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                if not required_keys.issubset(set(f.keys())):
+                    return False
+        else:
+            return False
+
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            return f.get_slice(probe_weight).get_dtype() == "U8"
+    except Exception as err:
+        logger.warning(
+            "Failed to inspect serialized NextN expert quantization metadata: %s",
+            err,
+        )
+        return False
+
+
+def _maybe_disable_unserialized_modelopt_fp4_nextn(
+    config: PretrainedConfig,
+    vllm_config: VllmConfig,
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    if quant_config is None or quant_config.get_name() != "modelopt_fp4":
+        return quant_config
+
+    if not _has_serialized_modelopt_fp4_nextn_experts(config, vllm_config):
+        logger.warning_once(
+            "Disabling DeepSeek/GLM NextN modelopt_fp4 quant config because "
+            "serialized NextN FP4 expert weights were not found."
+        )
+        return None
+
+    # Config override may add whole-MTP-layer ignores for BF16 MTP checkpoints.
+    # If serialized NVFP4 NextN experts exist, remove only those synthetic
+    # whole-layer ignores and keep finer-grained checkpoint ignores.
+    unquantized_prefixes = getattr(
+        config, "vllm_unquantized_mtp_layer_prefixes", None
+    )
+    exclude_modules = getattr(quant_config, "exclude_modules", None)
+    if isinstance(unquantized_prefixes, list) and isinstance(exclude_modules, list):
+        synthetic_ignores = {
+            pattern
+            for prefix in unquantized_prefixes
+            for pattern in (prefix, f"{prefix}.*")
+        }
+        quant_config.exclude_modules = [
+            pattern for pattern in exclude_modules if pattern not in synthetic_ignores
+        ]
+        config.vllm_unquantized_mtp_layer_prefixes = []
+    return quant_config
+
+
+def _maybe_remap_fp8_scale_inv_name(
+    name: str, params_dict: dict[str, torch.nn.Parameter]
+) -> str:
+    if name in params_dict:
+        return name
+    if "weight_scale_inv" not in name:
+        return name
+    alt_name = name.replace("weight_scale_inv", "weight_scale")
+    return alt_name if alt_name in params_dict else name
+
+
+def _maybe_pad_glm_mtp_fused_qkv_fp8_weight(
+    name: str,
+    tensor: torch.Tensor,
+    param: torch.nn.Parameter,
+    shard_id: int | str | None,
+) -> torch.Tensor:
+    """Pad GLM FP8 MTP fused KV-A rows to the runtime block shape."""
+    if (
+        shard_id != 1
+        or not name.endswith("self_attn.fused_qkv_a_proj.weight")
+        or tensor.dtype != torch.float8_e4m3fn
+    ):
+        return tensor
+
+    output_dim = getattr(param, "output_dim", 0)
+    if tensor.shape[output_dim] != 576:
+        return tensor
+
+    padded_size = 640
+    pad_shape = list(tensor.shape)
+    pad_shape[output_dim] = padded_size - tensor.shape[output_dim]
+    padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+    logger.info_once(
+        "Padding GLM FP8 MTP fused_qkv_a_proj kv_a checkpoint shard for %s: "
+        "loaded shape %s -> output-dim %d padded to %d rows",
+        name,
+        tuple(tensor.shape),
+        output_dim,
+        padded_size,
+    )
+    return torch.cat((tensor, padding), dim=output_dim)
+
+
+def _try_load_fp8_linear_as_bf16(
+    name: str,
+    tensor: torch.Tensor,
+    buf: dict[str, dict[str, torch.Tensor]],
+    params_dict: dict[str, torch.nn.Parameter],
+    loaded_params: set[str],
+    shard_id: int | str | None = None,
+) -> bool:
+    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+    is_scale = name.endswith(".weight_scale_inv")
+    if not is_weight and not is_scale:
+        return False
+
+    base_name = name.rsplit(".", 1)[0] if is_weight else name.removesuffix(
+        ".weight_scale_inv"
+    )
+    weight_name = f"{base_name}.weight"
+    scale_name = f"{base_name}.weight_scale_inv"
+
+    # If the runtime module registered an FP8 scale parameter, let the normal
+    # quantized loader handle it.
+    if _maybe_remap_fp8_scale_inv_name(scale_name, params_dict) in params_dict:
+        return False
+    if weight_name not in params_dict:
+        return False
+
+    buffer_key = base_name if shard_id is None else f"{base_name}:{shard_id}"
+    entry = buf.setdefault(buffer_key, {})
+    entry["weight" if is_weight else "scale"] = tensor
+    if "weight" not in entry or "scale" not in entry:
+        return True
+
+    weight_fp8 = entry["weight"]
+    scale_inv = entry["scale"]
+    del buf[buffer_key]
+
+    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
+    weight_bf16 = scaled_dequantize(
+        weight_fp8,
+        scale_inv,
+        group_shape=GroupShape(block_size, block_size),
+        out_dtype=torch.bfloat16,
+    )
+    param = params_dict[weight_name]
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    if shard_id is None:
+        weight_loader(param, weight_bf16)
+    else:
+        weight_loader(param, weight_bf16, shard_id)
+    loaded_params.add(weight_name)
+    return True
+
+
 def _get_nextn_vllm_config(
+    config: PretrainedConfig,
     vllm_config: VllmConfig,
 ) -> tuple[VllmConfig, QuantizationConfig | None]:
-    quant_config = get_draft_quant_config(vllm_config)
-    # GLM-5 stores NextN/MTP weights in a separate `mtp.safetensors` file and
-    # those tensors are BF16 rather than NVFP4-packed. Keep the draft path
-    # unquantized so MoE/attention params match the checkpoint layout.
-    if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-        nextn_vllm_config = copy(vllm_config)
-        nextn_vllm_config.quant_config = None
-        return nextn_vllm_config, None
-
+    quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
+        config, vllm_config, get_draft_quant_config(vllm_config)
+    )
     if quant_config is vllm_config.quant_config:
         return vllm_config, quant_config
 
-    return replace(vllm_config, quant_config=quant_config), quant_config
+    nextn_vllm_config = copy(vllm_config)
+    nextn_vllm_config.quant_config = quant_config
+    return nextn_vllm_config, quant_config
 
 
 class SharedHead(nn.Module):
@@ -86,7 +306,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
-        mtp_vllm_config, quant_config = _get_nextn_vllm_config(vllm_config)
+        mtp_vllm_config, quant_config = _get_nextn_vllm_config(config, vllm_config)
         layer_idx = int(prefix.rsplit(".", 1)[-1])
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -127,6 +347,8 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
+        # The first sequence position has no previous-token input for MTP.
+        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
         normed_inputs_embeds = self.enorm(inputs_embeds)
         normed_previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -222,11 +444,36 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        self.quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
+            self.config, vllm_config, get_draft_quant_config(vllm_config)
+        )
+        self._exclude_unquantized_mtp_layers_from_quant_config()
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
+
+    def _exclude_unquantized_mtp_layers_from_quant_config(self) -> None:
+        unquantized_prefixes = getattr(
+            self.config, "vllm_unquantized_mtp_layer_prefixes", None
+        )
+        exclude_modules = getattr(self.quant_config, "exclude_modules", None)
+        if not unquantized_prefixes or not isinstance(exclude_modules, list):
+            return
+
+        added_patterns = []
+        for prefix in unquantized_prefixes:
+            for pattern in (prefix, f"{prefix}.*"):
+                if pattern not in exclude_modules:
+                    exclude_modules.append(pattern)
+                    added_patterns.append(pattern)
+
+        if added_patterns:
+            logger.info(
+                "Excluding MTP layers from checkpoint quantization: %s",
+                added_patterns,
+            )
 
     def set_moe_parameters(self):
         self.expert_weights = []
@@ -312,6 +559,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         loaded_params: set[str] = set()
         loaded_spec_layers: set[int] = set()
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
+        _pending_fp8_linear: dict = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -325,6 +573,15 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
             if _try_load_fp8_indexer_wk(
                 name, loaded_weight, _pending_wk_fp8, params_dict, loaded_params
+            ):
+                loaded_spec_layers.add(spec_layer)
+                continue
+            if _try_load_fp8_linear_as_bf16(
+                name,
+                loaded_weight,
+                _pending_fp8_linear,
+                params_dict,
+                loaded_params,
             ):
                 loaded_spec_layers.add(spec_layer)
                 continue
@@ -347,18 +604,47 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
                 # QKV fusion is optional, fall back to normal
                 # weight loading if it's not enabled
-                if (
-                    param_name == "fused_qkv_a_proj"
-                ) and name_mapped not in params_dict:
-                    continue
-                else:
-                    name = name_mapped
+                if param_name == "fused_qkv_a_proj":
+                    # FP8 checkpoints provide scale tensors as
+                    # *.weight_scale_inv, while the fused runtime module may
+                    # only expose the fused weight or a remapped *.weight_scale.
+                    has_fused_target = name_mapped in params_dict
+                    if name_mapped.endswith(".weight_scale_inv"):
+                        fused_weight = name_mapped.removesuffix(
+                            ".weight_scale_inv"
+                        ) + ".weight"
+                        has_fused_target = (
+                            has_fused_target
+                            or fused_weight in params_dict
+                            or _maybe_remap_fp8_scale_inv_name(
+                                name_mapped, params_dict
+                            )
+                            in params_dict
+                        )
+                    if not has_fused_target:
+                        continue
+                name = name_mapped
+
+                if _try_load_fp8_linear_as_bf16(
+                    name,
+                    loaded_weight,
+                    _pending_fp8_linear,
+                    params_dict,
+                    loaded_params,
+                    shard_id=shard_id,
+                ):
+                    loaded_spec_layers.add(spec_layer)
+                    break
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
+                name = _maybe_remap_fp8_scale_inv_name(name, params_dict)
                 param = params_dict[name]
+                loaded_weight = _maybe_pad_glm_mtp_fused_qkv_fp8_weight(
+                    name, loaded_weight, param, shard_id
+                )
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_spec_layers.add(spec_layer)
@@ -425,6 +711,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         # Do not modify `name` since the loop may continue here
                         # Instead, create a new variable
                         name_mapped = chunk_name.replace(weight_name, param_name)
+                        name_mapped = _maybe_remap_fp8_scale_inv_name(
+                            name_mapped, params_dict
+                        )
 
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
@@ -463,6 +752,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         if name is None:
                             continue
 
+                        name = _maybe_remap_fp8_scale_inv_name(name, params_dict)
                         # According to DeepSeek-V3 Technical Report, MTP modules
                         # shares embedding layer. We only load the first weights.
                         if (

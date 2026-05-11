@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import json
+import os
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -31,6 +33,89 @@ else:
     )
 
 logger = init_logger(__name__)
+
+
+def _quant_config_targets_prefix(
+    quant_config: dict[str, Any],
+    module_prefix: str,
+) -> bool:
+    escaped_prefix = module_prefix.replace(".", r"\.")
+    config_groups = quant_config.get("config_groups", {})
+    if not isinstance(config_groups, dict):
+        config_groups = {}
+
+    for group in config_groups.values():
+        if not isinstance(group, dict):
+            continue
+        targets = group.get("targets", [])
+        if not isinstance(targets, list):
+            continue
+        for target in targets:
+            target_str = str(target)
+            if module_prefix in target_str or escaped_prefix in target_str:
+                return True
+
+    quantized_layers = quant_config.get("quantized_layers", {})
+    if isinstance(quantized_layers, dict):
+        for layer_name in quantized_layers:
+            layer_name = str(layer_name)
+            if (
+                layer_name == module_prefix
+                or layer_name.startswith(module_prefix + ".")
+                or module_prefix in layer_name
+                or escaped_prefix in layer_name
+            ):
+                return True
+    return False
+
+
+def _resolve_cached_hf_model_path(model_path: str | None) -> str | None:
+    if not model_path or os.path.isdir(model_path):
+        return model_path
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_index = try_to_load_from_cache(
+            model_path, "model.safetensors.index.json"
+        )
+        if isinstance(cached_index, str):
+            return os.path.dirname(cached_index)
+    except Exception:
+        return None
+    return None
+
+
+def _has_serialized_glm_nextn_fp4_experts(hf_config: PretrainedConfig) -> bool:
+    model_path = None
+    for attr in ("_name_or_path", "name_or_path"):
+        model_path = _resolve_cached_hf_model_path(getattr(hf_config, attr, None))
+        if model_path:
+            break
+    if model_path is None:
+        return False
+
+    nextn_layer_id = getattr(hf_config, "num_hidden_layers", None)
+    if nextn_layer_id is None:
+        return False
+
+    prefix = f"model.layers.{nextn_layer_id}.mlp.experts.0.down_proj"
+    required = {
+        f"{prefix}.weight",
+        f"{prefix}.weight_scale",
+        f"{prefix}.weight_scale_2",
+        f"{prefix}.input_scale",
+    }
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return False
+
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+    except Exception:
+        return False
+    return required.issubset(weight_map)
+
 
 MTPModelTypes = Literal[
     "deepseek_mtp",
@@ -319,6 +404,31 @@ class SpeculativeConfig:
             "deepseek_v32",
             "glm_moe_dsa",
         ):
+            if hf_config.model_type == "glm_moe_dsa":
+                quant_config = getattr(hf_config, "quantization_config", None)
+                if isinstance(quant_config, dict):
+                    quant_config = copy.deepcopy(quant_config)
+                    ignored = list(quant_config.get("ignore", []))
+                    mtp_start = getattr(hf_config, "num_hidden_layers", None)
+                    mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+                    if (
+                        mtp_start is not None
+                        and mtp_layers
+                        and not _has_serialized_glm_nextn_fp4_experts(hf_config)
+                    ):
+                        unquantized_mtp_prefixes = []
+                        for layer_idx in range(mtp_start, mtp_start + mtp_layers):
+                            prefix = f"model.layers.{layer_idx}"
+                            if _quant_config_targets_prefix(quant_config, prefix):
+                                continue
+                            unquantized_mtp_prefixes.append(prefix)
+                            ignored.extend((prefix, f"{prefix}.*"))
+                        if unquantized_mtp_prefixes:
+                            quant_config["ignore"] = ignored
+                            hf_config.quantization_config = quant_config
+                            hf_config.vllm_unquantized_mtp_layer_prefixes = (
+                                unquantized_mtp_prefixes
+                            )
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "deepseek_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
