@@ -1074,6 +1074,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        layer_idx_override: int | None = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1089,7 +1091,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         moe_layer_freq = getattr(config, "moe_layer_freq", 1)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
-        layer_idx = int(prefix.split(sep=".")[-1])
+        layer_idx = (
+            layer_idx_override
+            if layer_idx_override is not None
+            else int(prefix.split(sep=".")[-1])
+        )
         self.layer_idx = layer_idx
 
         # verify MLA attention specific fields
@@ -1126,11 +1132,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        if (
-            config.n_routed_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % moe_layer_freq == 0
-        ):
+        if _should_use_nextn_moe_layer(config, layer_idx, moe_layer_freq, is_nextn):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 parallel_config=parallel_config,
@@ -1746,3 +1748,18 @@ def get_spec_layer_idx_from_weight_name(
             ) or weight_name.startswith(f"layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
+
+
+def _should_use_nextn_moe_layer(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int,
+    moe_layer_freq: int,
+    is_nextn: bool,
+) -> bool:
+    return config.n_routed_experts is not None and (
+        is_nextn
+        or (
+            layer_idx >= config.first_k_dense_replace
+            and layer_idx % moe_layer_freq == 0
+        )
+    )
