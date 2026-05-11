@@ -91,6 +91,7 @@ def _get_backend_priorities(
             if kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype):
                 # Prefer FlashInfer for fp8 kv cache
                 sparse_backends = [
+                    AttentionBackendEnum.B12X_MLA_SPARSE,
                     AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
                     AttentionBackendEnum.FLASHMLA_SPARSE,
                 ]

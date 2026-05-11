@@ -1,0 +1,77 @@
+FROM voipmonitor/vllm:glm51-kimi-20260510
+
+ARG B12X_REPO=https://github.com/local-inference-lab/b12x.git
+ARG B12X_COMMIT=3917cb2fe5a2118eaab8b68f7710c71aad9e4b1c
+
+COPY patches/b12x-0.13-vllm/b12x-0.13-vllm-compat.patch /tmp/b12x-0.13-vllm-compat.patch
+
+RUN git clone --filter=blob:none "${B12X_REPO}" /tmp/b12x-src \
+  && cd /tmp/b12x-src \
+  && git checkout "${B12X_COMMIT}" \
+  && patch -p1 < /tmp/b12x-0.13-vllm-compat.patch \
+  && /opt/venv/bin/pip install --no-deps /tmp/b12x-src \
+  && rm -rf /tmp/b12x-src \
+            /tmp/b12x-0.13-vllm-compat.patch \
+            /opt/venv/lib/python3.12/site-packages/b12x/**/__pycache__ \
+            /opt/venv/lib/python3.12/site-packages/b12x/__pycache__
+
+COPY vllm/v1/attention/backend.py /opt/vllm/vllm/v1/attention/backend.py
+COPY vllm/v1/attention/backend.py /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backend.py
+COPY vllm/v1/attention/backends/utils.py /opt/vllm/vllm/v1/attention/backends/utils.py
+COPY vllm/v1/attention/backends/utils.py /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/utils.py
+COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py /opt/vllm/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+COPY vllm/v1/attention/backends/mla/indexer.py /opt/vllm/vllm/v1/attention/backends/mla/indexer.py
+COPY vllm/v1/attention/backends/mla/indexer.py /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/indexer.py
+COPY vllm/v1/spec_decode/dflash.py /opt/vllm/vllm/v1/spec_decode/dflash.py
+COPY vllm/v1/spec_decode/dflash.py /opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/dflash.py
+COPY vllm/v1/spec_decode/llm_base_proposer.py /opt/vllm/vllm/v1/spec_decode/llm_base_proposer.py
+COPY vllm/v1/spec_decode/llm_base_proposer.py /opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/llm_base_proposer.py
+COPY vllm/v1/worker/gpu_model_runner.py /opt/vllm/vllm/v1/worker/gpu_model_runner.py
+COPY vllm/v1/worker/gpu_model_runner.py /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
+COPY vllm/v1/worker/ubatch_utils.py /opt/vllm/vllm/v1/worker/ubatch_utils.py
+COPY vllm/v1/worker/ubatch_utils.py /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/ubatch_utils.py
+COPY vllm/model_executor/kernels/linear/nvfp4/b12x.py /opt/vllm/vllm/model_executor/kernels/linear/nvfp4/b12x.py
+COPY vllm/model_executor/kernels/linear/nvfp4/b12x.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear/nvfp4/b12x.py
+COPY vllm/model_executor/layers/fused_moe/b12x_moe.py /opt/vllm/vllm/model_executor/layers/fused_moe/b12x_moe.py
+COPY vllm/model_executor/layers/fused_moe/b12x_moe.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/b12x_moe.py
+COPY scripts/run-glm51-vllm /usr/local/bin/run-glm51-vllm
+COPY scripts/run-kimi26-vllm /usr/local/bin/run-kimi26-vllm
+COPY scripts/verify-glm-kimi-canonical.sh /usr/local/bin/verify-glm-kimi-canonical
+
+RUN rm -rf \
+      /opt/vllm/vllm/v1/attention/__pycache__ \
+      /opt/vllm/vllm/v1/attention/backends/__pycache__ \
+      /opt/vllm/vllm/v1/attention/backends/mla/__pycache__ \
+      /opt/vllm/vllm/v1/spec_decode/__pycache__ \
+      /opt/vllm/vllm/v1/worker/__pycache__ \
+      /opt/vllm/vllm/model_executor/kernels/linear/nvfp4/__pycache__ \
+      /opt/vllm/vllm/model_executor/layers/fused_moe/__pycache__ \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/__pycache__ \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/__pycache__ \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/__pycache__ \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/__pycache__ \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/__pycache__ \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear/nvfp4/__pycache__ \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/__pycache__ \
+  && chmod +x /usr/local/bin/run-glm51-vllm /usr/local/bin/run-kimi26-vllm /usr/local/bin/verify-glm-kimi-canonical \
+  && /opt/venv/bin/python -m py_compile \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backend.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/utils.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/indexer.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/dflash.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/llm_base_proposer.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/v1/worker/ubatch_utils.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear/nvfp4/b12x.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/b12x_moe.py \
+  && /usr/local/bin/verify-glm-kimi-canonical /opt/vllm
+
+LABEL org.opencontainers.image.description="vLLM GLM/Kimi image with consolidated canonical Python runtime, b12x 0.13.0 update, DCP/LSE, CPU-sync, and W4A16 compatibility fixes" \
+      voipmonitor.b12x.upstream_repo="local-inference-lab/b12x" \
+      voipmonitor.b12x.upstream_commit="3917cb2fe5a2118eaab8b68f7710c71aad9e4b1c" \
+      voipmonitor.b12x.compat_patch="patches/b12x-0.13-vllm/b12x-0.13-vllm-compat.patch" \
+      voipmonitor.b12x.w4a16_default="false" \
+      voipmonitor.base_image="voipmonitor/vllm:glm51-kimi-20260510" \
+      voipmonitor.vllm.canonical_branch="codex/glm51-kimi-canonical-a16-20260511"
