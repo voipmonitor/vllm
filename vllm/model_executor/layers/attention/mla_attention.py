@@ -416,6 +416,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 "KV cache format, please set `--attention-backend FLASHMLA_SPARSE`"
             )
 
+        # The C++ MLA cache ops only accept "auto" or fp8 variants.
+        if kv_cache_dtype in ("bfloat16", "float16"):
+            kv_cache_dtype = "auto"
+
         # Initialize KV cache quantization attributes
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
