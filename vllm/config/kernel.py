@@ -110,6 +110,7 @@ class IrOpPriorityConfig:
 
 MoEBackend = Literal[
     "auto",
+    "b12x",
     "triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
@@ -142,6 +143,7 @@ class KernelConfig:
     """Backend for MoE expert computation kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
+    - "b12x": Use the external b12x SM12x Blackwell fused MoE backend
     - "triton": Use Triton-based fused MoE kernels
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels

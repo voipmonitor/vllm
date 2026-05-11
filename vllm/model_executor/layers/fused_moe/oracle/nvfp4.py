@@ -42,6 +42,7 @@ logger = init_logger(__name__)
 
 
 class NvFp4MoeBackend(Enum):
+    B12X = "B12X"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
@@ -109,6 +110,13 @@ def backend_to_kernel_cls(
 
         return [FlashInferCuteDSLBatchedExperts]
 
+    elif backend == NvFp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.experts.b12x_nvfp4_moe import (
+            B12xExperts,
+        )
+
+        return [B12xExperts]
+
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassExpertsFp4,
@@ -135,6 +143,7 @@ def backend_to_kernel_cls(
 def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
     """Map user's MoEBackend to NvFp4MoeBackend."""
     mapping = {
+        "b12x": NvFp4MoeBackend.B12X,
         "cutlass": NvFp4MoeBackend.VLLM_CUTLASS,
         "flashinfer_trtllm": NvFp4MoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
@@ -162,6 +171,7 @@ def select_nvfp4_moe_backend(
 
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = [
+        NvFp4MoeBackend.B12X,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
@@ -333,7 +343,8 @@ def convert_to_nvfp4_moe_kernel_format(
             a2_scale=a2_scale,
         )
     elif (
-        nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
+        nvfp4_backend == NvFp4MoeBackend.B12X
+        or nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
         or nvfp4_backend == NvFp4MoeBackend.VLLM_CUTLASS
     ):
         (
