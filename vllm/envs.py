@@ -248,6 +248,8 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
+    VLLM_ENABLE_MLA_PREATTN_FANOUT: bool = False
+    BOB_ENABLE_EAGLE3_FANOUT: bool = False
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -1701,6 +1703,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for the default value of 1024 tokens.
     "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": lambda: int(
         os.getenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "1024")
+    ),
+    # Enable sparse MLA pre-attention GEMM fan-out. The MLA wrapper
+    # auto-enables this for validated sparse MLA backends unless this env var
+    # is explicitly set.
+    "VLLM_ENABLE_MLA_PREATTN_FANOUT": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_MLA_PREATTN_FANOUT", "0"))
+    ),
+    # Optional dense MLA fan-out hook for draft models. Default off.
+    "BOB_ENABLE_EAGLE3_FANOUT": lambda: bool(
+        int(os.getenv("BOB_ENABLE_EAGLE3_FANOUT", "0"))
     ),
     # Format for saving torch.compile cache artifacts
     # - "binary": saves as binary file

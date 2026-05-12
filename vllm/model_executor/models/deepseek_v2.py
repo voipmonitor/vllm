@@ -674,16 +674,27 @@ class Indexer(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        kw: torch.Tensor | None = None,
+        q_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
+        if q_raw is None:
+            q, _ = self.wq_b(qr)
+        else:
+            q = q_raw
         q = q.view(-1, self.n_head, self.head_dim)
 
         if current_platform.is_rocm():
             # This path should works on all platform, will remove extra
             # branches in the future
-            # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            # Fused wk + weights_proj: one GEMM, then split. The outer MLA
+            # wrapper may precompute this on an auxiliary stream.
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -696,8 +707,10 @@ class Indexer(nn.Module):
             q_pe, q_nope = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
-            # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            # Fused wk + weights_proj: one GEMM, then split. The outer MLA
+            # wrapper may precompute this on an auxiliary stream.
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 

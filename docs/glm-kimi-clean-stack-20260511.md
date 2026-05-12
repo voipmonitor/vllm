@@ -182,7 +182,25 @@ Use this order so each commit is reviewable and rebaseable.
 
    Runtime evidence: `glm51-kimi-comm-20260508` and later GLM DCP tests.
 
-8. `cpu-sync-cpuhangfix`
+8. `glm-sparse-mla-fanout`
+
+   Port the historical sparse MLA pre-attention/mid-attention fan-out patch:
+
+   - `VLLM_ENABLE_MLA_PREATTN_FANOUT`
+   - `BOB_ENABLE_EAGLE3_FANOUT`
+   - `execute_in_parallel` tracing fallback and callable aux-stream support
+   - optional `kw`/`q_raw` inputs to the GLM sparse indexer
+
+   This is a performance path for GLM sparse MLA long prefill. It auto-enables
+   only for validated sparse MLA backends such as `B12X_MLA_SPARSE` and
+   `FLASHMLA_SPARSE`; Kimi `TRITON_MLA` remains unaffected unless explicitly
+   forced.
+
+   Runtime evidence: all inspected Docker snapshots carried this patch:
+   `glm51-kimi-comm-20260508`, `glm51-kimi-20260510`, and
+   `glm51-b12x-a16-padfix-cpuhangfix-20260511`.
+
+9. `cpu-sync-cpuhangfix`
 
    Preserve and verify the `seq_lens_cpu_upper_bound` fix from upstream
    `#40654` and from `glm51-b12x-a16-padfix-cpuhangfix-20260511`.
@@ -202,14 +220,14 @@ Use this order so each commit is reviewable and rebaseable.
    already contains the upstream form of this fix, so this topic is primarily
    a verifier/audit step unless the GLM B12X path needs additional propagation.
 
-9. `b12x-moe-a16`
+10. `b12x-moe-a16`
 
    Port `B12X_MOE_FORCE_A16=1` support and padding fixes without falling back
    to FlashInfer/CUTLASS for the target GLM MoE path.
 
    Runtime evidence: `glm51-b12x-a16-padfix-cpuhangfix-20260511`.
 
-10. `kimi-launch-contract`
+11. `kimi-launch-contract`
 
    Preserve the Kimi-K2.6 runtime contract:
 
@@ -220,7 +238,7 @@ Use this order so each commit is reviewable and rebaseable.
 
    Runtime evidence: `glm51-kimi-20260510`.
 
-11. `glm-launch-contract`
+12. `glm-launch-contract`
 
    Preserve the GLM-5.1 runtime contract:
 
@@ -230,12 +248,12 @@ Use this order so each commit is reviewable and rebaseable.
    - target `MOE_BACKEND=b12x`
    - draft MoE remains `flashinfer_cutlass` unless explicitly changed
 
-12. `metrics-and-observability`
+13. `metrics-and-observability`
 
     Ported from `#40895`. This is not a speed path, but it prevents
     KV-budget/DCP confusion in future benchmark tooling.
 
-13. `build-runtime`
+14. `build-runtime`
 
     Keep Docker/build changes as the last topic:
 
@@ -316,6 +334,9 @@ Findings that are already captured by this clean stack:
 - GLM DCP correctness depends on returning valid LSE from the B12X sparse MLA
   split path. This is covered by the vLLM sparse MLA integration plus the
   external B12X LSE/split commits.
+- GLM long-prefill performance depends on the sparse MLA fan-out patch that was
+  present in all inspected verified Docker images. The current clean stack
+  carries it as an explicit source patch instead of relying on an image overlay.
 - The historical vanilla `b12x==0.11.1` overlay had three important runtime
   deltas: NSA indexer CPU-sync reduction, tiled top-k dynamic layout keys, and
   the PCIe oneshot completion barrier. The current external B12X branch carries
