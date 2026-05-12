@@ -934,6 +934,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
+        layer_idx: int | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1050,7 +1051,9 @@ class DeepseekV2MLAAttention(nn.Module):
                 f"{prefix}.indexer",
             )
 
-            layer_id = extract_layer_index(prefix)
+            layer_id = (
+                layer_idx if layer_idx is not None else extract_layer_index(prefix)
+            )
             _skip_topk = _should_skip_index_topk(config, layer_id)
             if _skip_topk:
                 logger.info_once(
@@ -1115,6 +1118,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        quant_config: QuantizationConfig | None = None,
+        layer_idx_override: int | None = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1122,7 +1128,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
+        if quant_config is None:
+            quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
@@ -1130,7 +1137,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         moe_layer_freq = getattr(config, "moe_layer_freq", 1)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
-        layer_idx = int(prefix.split(sep=".")[-1])
+        layer_idx = (
+            layer_idx_override
+            if layer_idx_override is not None
+            else int(prefix.split(sep=".")[-1])
+        )
         self.layer_idx = layer_idx
 
         # verify MLA attention specific fields
@@ -1150,7 +1161,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             attn_cls = DeepseekV2MLAAttention
         else:
             attn_cls = DeepseekV2Attention
-        self.self_attn = attn_cls(
+        attn_kwargs = dict(
             vllm_config=vllm_config,
             config=config,
             hidden_size=self.hidden_size,
@@ -1166,12 +1177,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
         )
+        if attn_cls is DeepseekV2MLAAttention:
+            attn_kwargs["layer_idx"] = layer_idx
+        self.self_attn = attn_cls(**attn_kwargs)
 
-        if (
-            config.n_routed_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % moe_layer_freq == 0
-        ):
+        if _should_use_nextn_moe_layer(config, layer_idx, moe_layer_freq, is_nextn):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 parallel_config=parallel_config,
@@ -1787,3 +1797,18 @@ def get_spec_layer_idx_from_weight_name(
             ) or weight_name.startswith(f"layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
+
+
+def _should_use_nextn_moe_layer(
+    config: DeepseekV2Config | DeepseekV3Config,
+    layer_idx: int,
+    moe_layer_freq: int,
+    is_nextn: bool,
+) -> bool:
+    return config.n_routed_experts is not None and (
+        is_nextn
+        or (
+            layer_idx >= config.first_k_dense_replace
+            and layer_idx % moe_layer_freq == 0
+        )
+    )

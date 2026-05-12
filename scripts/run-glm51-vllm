@@ -21,16 +21,16 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-202752}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-256}"
-MOE_BACKEND="${MOE_BACKEND:-flashinfer_cutlass}"
+MOE_BACKEND="${MOE_BACKEND:-b12x}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 
-DEFAULT_HF_OVERRIDES='{"index_topk_pattern":"FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSSF"}'
+DEFAULT_HF_OVERRIDES='{"index_topk_pattern":"FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'
 HF_OVERRIDES="${HF_OVERRIDES:-$DEFAULT_HF_OVERRIDES}"
 
 SPEC_ARGS=()
 if [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
-  DEFAULT_SPEC_CONFIG='{"model":"lukealonso/GLM-5.1-NVFP4-MTP","method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass","use_local_argmax_reduction":true}'
+  DEFAULT_SPEC_CONFIG='{"model":"lukealonso/GLM-5.1-NVFP4-MTP","method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}'
   SPEC_CONFIG="${SPEC_CONFIG:-$DEFAULT_SPEC_CONFIG}"
   SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
 fi

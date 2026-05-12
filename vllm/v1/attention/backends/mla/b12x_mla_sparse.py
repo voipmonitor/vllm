@@ -748,8 +748,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             )
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError("B12xMLASparseImpl only supports decoder MLA")
-        if kv_cache_dtype != "fp8_ds_mla":
-            raise NotImplementedError("B12X sparse MLA requires fp8_ds_mla KV cache")
+        if kv_cache_dtype not in ("fp8", "fp8_ds_mla"):
+            raise NotImplementedError("B12X sparse MLA requires fp8/fp8_ds_mla KV cache")
         assert indexer is not None, "Indexer required for sparse MLA"
 
         self.num_heads = num_heads

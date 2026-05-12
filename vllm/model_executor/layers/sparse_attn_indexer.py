@@ -264,6 +264,18 @@ def _has_sgl_kernel_fast_topk_transform() -> bool:
     return _SGL_KERNEL_FAST_TOPK_TRANSFORM_AVAILABLE
 
 
+def _b12x_prefill_max_num_reqs(attn_metadata, chunk, q_rows: int) -> int:
+    num_reqs = getattr(attn_metadata, "num_reqs", None)
+    if num_reqs is not None:
+        return max(int(num_reqs), 1)
+
+    cu_seq_lens = getattr(chunk, "cu_seq_lens", None)
+    if cu_seq_lens is not None:
+        return max(int(cu_seq_lens.numel()) - 1, 1)
+
+    return max(int(q_rows), 1)
+
+
 def _b12x_tiled_topk_workspace_specs(
     *,
     api,
@@ -691,11 +703,14 @@ def sparse_attn_indexer(
             b12x_extend_phantoms = None
             if use_b12x_indexer and b12x_nsa_api is not None:
                 try:
+                    b12x_max_num_reqs = _b12x_prefill_max_num_reqs(
+                        attn_metadata_narrowed, chunk, int(q_chunk.shape[0])
+                    )
                     b12x_workspace = _get_b12x_indexer_extend_workspace(
                         q_fp8=q_chunk,
                         index_k_cache=kv_cache,
                         topk_tokens=topk_tokens,
-                        max_num_reqs=attn_metadata_narrowed.num_reqs,
+                        max_num_reqs=b12x_max_num_reqs,
                         max_model_len=max_model_len,
                         total_seq_lens=chunk.total_seq_lens,
                         head_dim=head_dim,

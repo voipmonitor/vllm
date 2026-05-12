@@ -770,7 +770,14 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        weight_loader(param, loaded_weight)
+                        try:
+                            weight_loader(param, loaded_weight)
+                        except AssertionError as e:
+                            raise AssertionError(
+                                "MTP weight shape mismatch while loading "
+                                f"{name}: param={tuple(param.shape)} "
+                                f"loaded={tuple(loaded_weight.shape)}"
+                            ) from e
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 

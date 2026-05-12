@@ -118,6 +118,14 @@ def _has_serialized_glm_nextn_fp4_experts(hf_config: PretrainedConfig) -> bool:
     return required.issubset(weight_map)
 
 
+def _extend_unique(values: list[str], additions: list[str]) -> None:
+    seen = set(values)
+    for value in additions:
+        if value not in seen:
+            values.append(value)
+            seen.add(value)
+
+
 MTPModelTypes = Literal[
     "deepseek_mtp",
     "mimo_mtp",
@@ -359,21 +367,37 @@ class SpeculativeConfig:
                     ignored = list(quant_config.get("ignore", []))
                     mtp_start = getattr(hf_config, "num_hidden_layers", None)
                     mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
-                    if (
+                    has_serialized_nextn_experts = (
                         mtp_start is not None
                         and mtp_layers
-                        and not _has_serialized_glm_nextn_fp4_experts(hf_config)
-                    ):
+                        and _has_serialized_glm_nextn_fp4_experts(hf_config)
+                    )
+                    if mtp_start is not None and mtp_layers:
                         unquantized_mtp_prefixes = []
                         for layer_idx in range(mtp_start, mtp_start + mtp_layers):
                             prefix = f"model.layers.{layer_idx}"
-                            if _quant_config_targets_prefix(quant_config, prefix):
-                                continue
-                            unquantized_mtp_prefixes.append(prefix)
-                            ignored.extend((prefix, f"{prefix}.*"))
-                        if unquantized_mtp_prefixes:
+                            if has_serialized_nextn_experts:
+                                _extend_unique(
+                                    ignored,
+                                    [
+                                        f"{prefix}.self_attn*",
+                                        f"{prefix}.eh_proj*",
+                                        f"{prefix}.enorm*",
+                                        f"{prefix}.hnorm*",
+                                        f"{prefix}.shared_head*",
+                                        f"{prefix}.mlp.gate*",
+                                        f"{prefix}.mlp.shared_experts*",
+                                    ],
+                                )
+                            else:
+                                if _quant_config_targets_prefix(quant_config, prefix):
+                                    continue
+                                unquantized_mtp_prefixes.append(prefix)
+                                _extend_unique(ignored, [prefix, f"{prefix}.*"])
+                        if has_serialized_nextn_experts or unquantized_mtp_prefixes:
                             quant_config["ignore"] = ignored
                             hf_config.quantization_config = quant_config
+                        if unquantized_mtp_prefixes:
                             hf_config.vllm_unquantized_mtp_layer_prefixes = (
                                 unquantized_mtp_prefixes
                             )
