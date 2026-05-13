@@ -42,6 +42,12 @@ _B12X_MOE_STATIC_CHUNK_MAX_M = int(
     os.getenv("VLLM_B12X_MOE_STATIC_CHUNK_MAX_M", "0")
 )
 _B12X_MOE_PAD_MIN_M = int(os.getenv("B12X_MOE_PAD_MIN_M", "512"))
+_B12X_MOE_FORCE_NVFP4 = os.getenv(
+    "VLLM_B12X_MOE_FORCE_NVFP4", "0"
+) not in ("", "0", "false", "False")
+_B12X_MOE_A16_MIN_LAYER = int(
+    os.getenv("VLLM_B12X_MOE_A16_MIN_LAYER", "-1")
+)
 
 # ---------------------------------------------------------------------------
 # Per-device workspace pool (mirrors SGLang's pattern).
@@ -222,6 +228,15 @@ def _has_b12x() -> bool:
         return False
 
 
+def _b12x_env_force_a16() -> bool:
+    return os.getenv("B12X_MOE_FORCE_A16", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Expert implementation
 # ---------------------------------------------------------------------------
@@ -272,6 +287,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self.device = moe_config.device
         self.num_experts = moe_config.num_local_experts
         self.out_dtype = moe_config.in_dtype
+        self.layer_name = moe_config.layer_name
+        self.layer_idx = moe_config.layer_idx
+        self._warned_global_a16 = False
 
     # ------------------------------------------------------------------
     # process_weights_after_loading: fuse input scales into g{1,2}_alphas
@@ -344,6 +362,44 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         # b12x fuses topk-weight application and expert reduction internally.
         return TopKWeightAndReduceNoOP()
+
+    def _select_quant_mode(self) -> str | None:
+        """Return the explicit b12x quant_mode override for this layer.
+
+        ``None`` preserves b12x's default behavior, including
+        ``B12X_MOE_FORCE_A16=1`` and its required alpha adjustment. Passing
+        ``"nvfp4"`` is safe and forces the original activation-quantized path.
+
+        W4A16 bypasses NVFP4 activation quant/dequant. On GLM-5.1 NVFP4 this
+        is not quality-preserving in early MoE layers because the checkpoint's
+        activation scales encode a narrow calibrated FP4 envelope. The optional
+        layer gate lets us keep early layers on NVFP4 while still testing A16
+        in later layers where the numerical delta is much smaller.
+        """
+        if _B12X_MOE_FORCE_NVFP4:
+            return "nvfp4"
+
+        if _B12X_MOE_A16_MIN_LAYER >= 0 and _b12x_env_force_a16():
+            if self.layer_idx is None:
+                logger.warning_once(
+                    "VLLM_B12X_MOE_A16_MIN_LAYER is set, but layer index "
+                    "is unavailable for %s; keeping b12x default MoE mode.",
+                    self.layer_name,
+                )
+                return None
+            if self.layer_idx < _B12X_MOE_A16_MIN_LAYER:
+                return "nvfp4"
+
+        if _b12x_env_force_a16() and not self._warned_global_a16:
+            self._warned_global_a16 = True
+            logger.warning_once(
+                "B12X_MOE_FORCE_A16=1 changes B12X MoE activation numerics. "
+                "For GLM-5.1 NVFP4 quality checks, use "
+                "VLLM_B12X_MOE_FORCE_NVFP4=1 or gate A16 with "
+                "VLLM_B12X_MOE_A16_MIN_LAYER."
+            )
+
+        return None
 
     # ------------------------------------------------------------------
     # workspace_shapes
@@ -421,6 +477,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             output=output,
             input_scales_are_reciprocal=True,
             input_scales_static=True,
+            quant_mode=self._select_quant_mode(),
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
