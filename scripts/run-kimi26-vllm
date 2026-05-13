@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${USE_NCCL_XML:-0}" != "1" ]]; then
+configure_nccl_transport() {
+  if [[ "${USE_NCCL_XML:-0}" == "1" ]]; then
+    return
+  fi
+
   unset NCCL_GRAPH_FILE
-fi
+
+  local nccl_pr2127_path="${NCCL_PR2127_PATH:-/opt/libnccl-pr2127.so.2.30.3}"
+  if [[ -f "${nccl_pr2127_path}" ]]; then
+    export VLLM_NCCL_SO_PATH="${VLLM_NCCL_SO_PATH:-${nccl_pr2127_path}}"
+    case " ${LD_PRELOAD//:/ } " in
+      *" ${nccl_pr2127_path} "*) ;;
+      *) export LD_PRELOAD="${nccl_pr2127_path}${LD_PRELOAD:+ ${LD_PRELOAD}}" ;;
+    esac
+  elif [[ "${DCP_SIZE:-1}" != "1" ]]; then
+    echo "ERROR: USE_NCCL_XML=0 with DCP_SIZE=${DCP_SIZE} requires ${nccl_pr2127_path}" >&2
+    exit 1
+  fi
+}
 
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-cpp}"
@@ -25,6 +41,8 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_MLA}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+
+configure_nccl_transport
 
 CUDAGRAPH_ARGS=()
 if [[ -n "${MAX_CUDAGRAPH_CAPTURE_SIZE}" ]]; then
