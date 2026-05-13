@@ -85,6 +85,18 @@ index e12b924..ff5aa6f 100644
              width = min(width, max(0, int(active_token_counts.max().item())))
      env_chunk = os.environ.get("B12X_MLA_SPLIT_CHUNK_SIZE", None)
      if env_chunk is not None:
+diff --git a/b12x/integration/tp_moe.py b/b12x/integration/tp_moe.py
+index 9e335dc..9e2f5a1 100644
+--- a/b12x/integration/tp_moe.py
++++ b/b12x/integration/tp_moe.py
+@@ -6,6 +6,7 @@ from contextlib import contextmanager
+ from dataclasses import dataclass, field
+ from typing import Dict, Tuple
+ 
++import cuda.bindings.driver as cuda
+ import cutlass
+ import cutlass.cute as cute
+ import torch
 diff --git a/b12x/attention/mla/workspace.py b/b12x/attention/mla/workspace.py
 index 408451e..e227d2f 100644
 --- a/b12x/attention/mla/workspace.py
@@ -252,7 +264,7 @@ diff --git a/b12x/integration/tp_moe.py b/b12x/integration/tp_moe.py
 index f69897d..390a044 100644
 --- a/b12x/integration/tp_moe.py
 +++ b/b12x/integration/tp_moe.py
-@@ -479,6 +479,17 @@ def clear_tp_moe_caches() -> None:
+@@ -479,6 +479,24 @@ def clear_tp_moe_caches() -> None:
  _FAST_MATH_DEFAULT = _env_flag("B12X_FAST_MATH", default=True)
 
 
@@ -265,6 +277,13 @@ index f69897d..390a044 100644
 +        # are immutable for the lifetime of the serving process, so a stable
 +        # sentinel is a valid cache-key component.
 +        return 0
++
++
++def _stream_arg(stream) -> int:
++    # CUTLASS DSL 4.5 packs runtime arguments through ctypes.c_void_p, which
++    # does not accept cuda.CUstream objects directly. cuda.CUstream implements
++    # int(stream), so pass the raw handle value at launch time.
++    return int(stream)
 +
 +
  def _first_env(*names: str) -> str | None:
@@ -316,3 +335,39 @@ index f69897d..390a044 100644
      )
      last_key, last_launcher = _LAST_EXACT_RELU2_BS1_NEMOTRON
      if last_key == cache_key:
+@@ -2946,7 +2969,7 @@ def _launch_exact_relu2_bs1_nemotron(
+         resolved.row_counts, resolved.active_expert_count, resolved.weight_expert_ids, resolved.global_to_local_expert,
+         launcher.input_gs, launcher.weights.w1_alpha, launcher.weights.w2_alpha, launcher.down_input_scale,
+         scatter_output, resolved.token_map, resolved.token_weights,
+-        launcher.mac, current_cuda_stream(),
++        launcher.mac, _stream_arg(current_cuda_stream()),
+     )
+     return scatter_output
+ 
+@@ -3020,7 +3043,7 @@ def _launch_dynamic(
+         workspace.physical_tiles_capacity * _dynamic_tile_m(quant_mode),
+         workspace.task_capacity,
+         workspace.physical_tiles_capacity,
+-        mac, stream,
++        mac, _stream_arg(stream),
+     )
+ 
+ 
+@@ -3125,7 +3148,7 @@ def _launch_compact_static(
+             workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
+             input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
+             scatter_output, workspace.token_map, workspace.token_weights,
+-            mac, stream,
++            mac, _stream_arg(stream),
+         )
+         return
+ 
+@@ -3166,7 +3189,7 @@ def _launch_compact_static(
+         workspace.row_counts, workspace.active_expert_count, workspace.weight_expert_ids, workspace.global_to_local_expert,
+         input_gs, weights.w1_alpha, weights.w2_alpha, down_input_scale,
+         scatter_output, workspace.token_map, workspace.token_weights,
+-        mac, stream,
++        mac, _stream_arg(stream),
+     )
+ 
+ 
