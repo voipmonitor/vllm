@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import gc
+import json
 import logging
 import os
 import time
@@ -101,7 +102,7 @@ def load_dataset_texts(
 
 
 def calculate_kld(
-    model_path: str,
+    model_path: str | None,
     texts: list[str],
     context_length: int,
     stride: int,
@@ -109,6 +110,8 @@ def calculate_kld(
     reference_model_path: str | None = None,
     llm_kwargs: dict[str, Any] | None = None,
     num_samples: int | None = None,
+    max_windows: int | None = None,
+    reference_only: bool = False,
     trust_remote_code: bool = False,
 ) -> tuple[float, int]:
     """
@@ -126,6 +129,8 @@ def calculate_kld(
         reference_model_path: Path to reference model (for Phase 1)
         llm_kwargs: Kwargs for initializing LLM (reference and test)
         num_samples: Maximum number of samples to process (None = all)
+        max_windows: Maximum number of sliding windows to process (None = 100)
+        reference_only: Generate reference logits and exit before loading test model
         trust_remote_code: Trust remote code when loading tokenizer
 
     Returns:
@@ -137,7 +142,8 @@ def calculate_kld(
     samples_to_process = texts[:num_samples] if num_samples else texts
     concatenated_text = "\n\n".join(samples_to_process)
 
-    max_tokens_for_eval = context_length + 99 * stride
+    window_limit = max_windows if max_windows is not None else 100
+    max_tokens_for_eval = context_length + max(0, window_limit - 1) * stride
     max_chars = max_tokens_for_eval * 5
     if len(concatenated_text) > max_chars:
         concatenated_text = concatenated_text[:max_chars]
@@ -175,6 +181,8 @@ def calculate_kld(
             ref_llm = LLM(model=reference_model_path, **(llm_kwargs or {}))
             window_idx = 0
             for start_idx in range(0, num_tokens - context_length + stride, stride):
+                if max_windows is not None and window_idx >= max_windows:
+                    break
                 end_idx = start_idx + context_length
                 if end_idx > num_tokens:
                     break
@@ -204,6 +212,10 @@ def calculate_kld(
             torch.accelerator.empty_cache()
             print(f"Saved {window_idx} reference logits to {ref_logits_dir}/")
 
+    if reference_only:
+        print(f"Reference-only mode complete: {reference_logits_path}")
+        return float("nan"), 0
+
     if reference_logits_path is None:
         raise ValueError(
             "Either --reference-logits or --reference-model must be provided"
@@ -215,11 +227,15 @@ def calculate_kld(
     ref_is_directory = os.path.isdir(reference_logits_path)
 
     # Phase 2: Compute KLD using test model with reference logits
+    if model_path is None:
+        raise ValueError("--model is required unless --reference-only is set")
     print("Phase 2: Computing KLD...")
     print(f"Loading test model: {model_path}")
     llm = LLM(model=model_path, **(llm_kwargs or {}))
     window_idx = 0
     for start_idx in range(0, num_tokens - context_length + stride, stride):
+        if max_windows is not None and window_idx >= max_windows:
+            break
         end_idx = start_idx + context_length
         if end_idx > num_tokens:
             break
@@ -322,7 +338,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Calculate KLD using vLLM's score mode"
     )
-    parser.add_argument("--model", type=str, required=True, help="Path to test model")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to test model (not required with --reference-only)",
+    )
     parser.add_argument(
         "--reference-model",
         type=str,
@@ -361,6 +382,17 @@ def main():
         help="Number of samples to process (default: all)",
     )
     parser.add_argument(
+        "--max-windows",
+        type=int,
+        default=None,
+        help="Maximum number of sliding windows to process (default: 100)",
+    )
+    parser.add_argument(
+        "--reference-only",
+        action="store_true",
+        help="Only generate reference logits, then exit before loading test model",
+    )
+    parser.add_argument(
         "--context-length",
         type=int,
         default=2048,
@@ -384,7 +416,47 @@ def main():
         default=0.35,
         help="GPU memory utilization (default: 0.35). vLLM reserves this fraction "
         "of each GPU for model+KV cache. 0.7 on 95GB GPUs = 66GB/GPU, which "
-        "is excessive for 8B models (~8GB). Use 0.35 or lower.",
+            "is excessive for 8B models (~8GB). Use 0.35 or lower.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        help="Model dtype passed to vLLM LLM (default: vLLM auto)",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=None,
+        help="KV cache dtype passed to vLLM LLM (e.g. auto, fp8, fp8_e4m3)",
+    )
+    parser.add_argument(
+        "--load-format",
+        type=str,
+        default=None,
+        help="Model load format passed to vLLM LLM (default: auto)",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Override vLLM max_model_len (default: context_length * 2)",
+    )
+    parser.add_argument(
+        "--hf-overrides",
+        type=str,
+        default=None,
+        help="JSON dict passed as vLLM hf_overrides",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Pass enforce_eager=True to vLLM LLM",
+    )
+    parser.add_argument(
+        "--disable-custom-all-reduce",
+        action="store_true",
+        help="Pass disable_custom_all_reduce=True to vLLM LLM",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -411,6 +483,10 @@ def main():
 
     if args.reference_model is None and args.reference_logits is None:
         parser.error("Either --reference-model or --reference-logits is required")
+    if args.reference_only and args.reference_model is None:
+        parser.error("--reference-only requires --reference-model")
+    if not args.reference_only and args.model is None:
+        parser.error("--model is required unless --reference-only is set")
 
     print(f"Loading dataset: {args.dataset}")
     texts = load_dataset_texts(args.dataset, args.dataset_config)
@@ -421,17 +497,31 @@ def main():
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "trust_remote_code": args.trust_remote_code,
         "enable_prefix_caching": False,
-        "max_model_len": args.context_length * 2,
+        "max_model_len": args.max_model_len or args.context_length * 2,
     }
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
+    if args.dtype:
+        llm_kwargs["dtype"] = args.dtype
+    if args.kv_cache_dtype:
+        llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
+    if args.load_format:
+        llm_kwargs["load_format"] = args.load_format
+    if args.hf_overrides:
+        llm_kwargs["hf_overrides"] = json.loads(args.hf_overrides)
+    if args.enforce_eager:
+        llm_kwargs["enforce_eager"] = True
+    if args.disable_custom_all_reduce:
+        llm_kwargs["disable_custom_all_reduce"] = True
     if args.language_model_only:
         llm_kwargs["language_model_only"] = True
 
     print("\nCalculating KLD...")
     print(f"  Context length: {args.context_length}")
     print(f"  Stride: {args.stride}")
+    print(f"  Max windows: {args.max_windows or 100}")
     print(f"  Samples: {args.num_samples or len(texts)}")
+    print(f"  Reference only: {args.reference_only}")
 
     start_time = time.time()
     mean_kld, total_positions = calculate_kld(
@@ -443,15 +533,21 @@ def main():
         reference_model_path=args.reference_model,
         llm_kwargs=llm_kwargs,
         num_samples=args.num_samples,
+        max_windows=args.max_windows,
+        reference_only=args.reference_only,
         trust_remote_code=args.trust_remote_code,
     )
     elapsed_time = time.time() - start_time
 
-    print("\nResults:")
-    print(f"  Mean KLD: {mean_kld:.6f}")
-    print(f"  Total positions: {total_positions}")
-    print(f"  Time elapsed: {elapsed_time:.2f} seconds")
-    print(f"  Positions/second: {total_positions / elapsed_time:.2f}")
+    if args.reference_only:
+        print("\nResults: reference logits generated")
+        print(f"  Time elapsed: {elapsed_time:.2f} seconds")
+    else:
+        print("\nResults:")
+        print(f"  Mean KLD: {mean_kld:.6f}")
+        print(f"  Total positions: {total_positions}")
+        print(f"  Time elapsed: {elapsed_time:.2f} seconds")
+        print(f"  Positions/second: {total_positions / elapsed_time:.2f}")
 
 
 if __name__ == "__main__":
