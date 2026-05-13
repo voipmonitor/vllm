@@ -4,7 +4,7 @@ FROM voipmonitor/vllm:glm51-kimi-20260510
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 ARG B12X_REPO=https://github.com/local-inference-lab/b12x.git
-ARG B12X_COMMIT=3917cb2fe5a2118eaab8b68f7710c71aad9e4b1c
+ARG B12X_COMMIT=7bf571d5b80009c2cc169a14cc8bcfa520659cbf
 ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
 ARG FLASHINFER_COMMIT=6885e76a5e12a59220b9dc199d86a64fbe5f6d78
 ARG VLLM_BUILD_VERSION=0.11.2.dev278+glm51kimi20260511
@@ -16,8 +16,6 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     FLASHINFER_NVCC_THREADS=1 \
     AOT_MAX_JOBS_CAP=8 \
     TORCH_CUDA_ARCH_LIST=12.0a
-
-COPY patches/b12x-0.13-vllm/b12x-0.13-vllm-compat.patch /tmp/b12x-0.13-vllm-compat.patch
 
 RUN /opt/venv/bin/python -m pip install --no-cache-dir --upgrade --pre \
       cuda-tile==1.3.0 \
@@ -45,9 +43,8 @@ RUN git clone --recursive --filter=blob:none "${FLASHINFER_REPO}" /tmp/flashinfe
 RUN git clone --filter=blob:none "${B12X_REPO}" /tmp/b12x-src \
   && cd /tmp/b12x-src \
   && git checkout "${B12X_COMMIT}" \
-  && patch -p1 < /tmp/b12x-0.13-vllm-compat.patch \
   && /opt/venv/bin/python -m pip install --no-cache-dir --no-deps --force-reinstall . \
-  && rm -rf /tmp/b12x-src /tmp/b12x-0.13-vllm-compat.patch
+  && rm -rf /tmp/b12x-src
 
 RUN /opt/venv/bin/python -m pip uninstall -y vllm || true \
   && rm -rf /opt/vllm \
@@ -122,8 +119,9 @@ ENV HF_OVERRIDES="" \
 LABEL org.opencontainers.image.description="vLLM GLM/Kimi canonical full-install image with b12x 0.13 update, FlashInfer git build, CUTE DSL 4.5.0, DCP/LSE and CPU-sync fixes" \
       voipmonitor.base_image="voipmonitor/vllm:glm51-kimi-20260510" \
       voipmonitor.vllm.canonical_branch="codex/glm51-kimi-canonical-a16-upstream-20260511" \
-      voipmonitor.b12x.upstream_repo="local-inference-lab/b12x" \
-      voipmonitor.b12x.upstream_commit="3917cb2fe5a2118eaab8b68f7710c71aad9e4b1c" \
+      voipmonitor.b12x.repo="local-inference-lab/b12x" \
+      voipmonitor.b12x.branch="codex/glm51-kimi-b12x-a16-cpuhangfix-cutedsl45-20260512" \
+      voipmonitor.b12x.commit="7bf571d5b80009c2cc169a14cc8bcfa520659cbf" \
       voipmonitor.flashinfer.upstream_repo="flashinfer-ai/flashinfer" \
       voipmonitor.flashinfer.upstream_commit="6885e76a5e12a59220b9dc199d86a64fbe5f6d78" \
       voipmonitor.cutedsl.version="4.5.0"

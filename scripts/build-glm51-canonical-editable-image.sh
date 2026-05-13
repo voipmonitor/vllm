@@ -3,13 +3,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-BASE_IMAGE="${BASE_IMAGE:-voipmonitor/vllm:glm51-canonical-githead-vllmdb22839-b12x9436cb8-20260512}"
 DATE_TAG="${DATE_TAG:-$(date -u +%Y%m%d)}"
 MAX_JOBS="${MAX_JOBS:-128}"
 CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-${MAX_JOBS}}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0a}"
 VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE:-0.11.2.dev278+glm51kimi${DATE_TAG}}"
-B12X_GIT_SHA="${B12X_GIT_SHA:-9436cb8}"
+BASE_IMAGE="${BASE_IMAGE:-}"
+B12X_GIT_SHA="${B12X_GIT_SHA:-}"
 CONTAINER_NAME="${CONTAINER_NAME:-glm51-vllm-editable-build-test}"
 
 VLLM_GIT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
@@ -19,6 +19,18 @@ IMAGE_TAG="${IMAGE_TAG:-voipmonitor/vllm:glm51-canonical-editable-vllm${VLLM_GIT
 if ! git -C "${ROOT_DIR}" diff --quiet || ! git -C "${ROOT_DIR}" diff --cached --quiet; then
   echo "Refusing to build from a dirty vLLM tree. Commit or stash changes first." >&2
   git -C "${ROOT_DIR}" status --short >&2
+  exit 1
+fi
+
+if [[ -z "${BASE_IMAGE}" || -z "${B12X_GIT_SHA}" ]]; then
+  cat >&2 <<'EOF'
+BASE_IMAGE and B12X_GIT_SHA must be set explicitly.
+
+This script only rebuilds/overlays editable vLLM inside an existing base image.
+It does not install or update B12X. Build the canonical full image from
+docker/Dockerfile.glm51-kimi-b12x013 first, then pass that image here together
+with the exact B12X git commit contained in it.
+EOF
   exit 1
 fi
 
@@ -71,4 +83,3 @@ docker commit \
   "${CONTAINER_NAME}" "${IMAGE_TAG}" >/dev/null
 
 echo "Built ${IMAGE_TAG}"
-
