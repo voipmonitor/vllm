@@ -121,6 +121,12 @@ _B12X_INDEXER_EXTEND_TILE_LOGITS_K_ROWS = int(
         str(_B12X_EXTEND_TOPK_SUPERTILE_K),
     )
 )
+_B12X_INDEXER_DECODE_MAX_Q_ROWS = int(
+    os.getenv(
+        "VLLM_B12X_INDEXER_DECODE_MAX_Q_ROWS",
+        os.getenv("MAX_CUDAGRAPH_CAPTURE_SIZE", "0"),
+    )
+)
 _DEBUG_NSA_INDEXER = os.getenv("VLLM_DEBUG_NSA_INDEXER", "0") == "1"
 _DEBUG_NSA_INDEXER_FILE = os.getenv(
     "VLLM_NSA_INDEXER_DEBUG_FILE", "/diag/nsa_indexer_debug.log"
@@ -349,7 +355,12 @@ def _get_b12x_indexer_workspace(
 
     page_size = int(index_k_cache.shape[1])
     max_page_table_width = max(1, (int(max_model_len) + page_size - 1) // page_size)
-    paged_max_q_rows = max(int(max_num_reqs), int(q_fp8.shape[0]), 1)
+    paged_max_q_rows = max(
+        _B12X_INDEXER_DECODE_MAX_Q_ROWS,
+        int(max_num_reqs),
+        int(q_fp8.shape[0]),
+        1,
+    )
     indexer_num_q_heads = int(q_fp8.shape[1])
     head_dim = 576
     v_head_dim = 512
@@ -446,7 +457,12 @@ def _get_b12x_indexer_phantoms(
 
     page_size = int(index_k_cache.shape[1])
     max_page_table_width = max(1, (int(max_model_len) + page_size - 1) // page_size)
-    max_q_rows = max(int(max_num_reqs), int(q_fp8.shape[0]), 1)
+    max_q_rows = max(
+        _B12X_INDEXER_DECODE_MAX_Q_ROWS,
+        int(max_num_reqs),
+        int(q_fp8.shape[0]),
+        1,
+    )
     indexer_num_q_heads = int(q_fp8.shape[1])
     key = (
         q_fp8.device.type,

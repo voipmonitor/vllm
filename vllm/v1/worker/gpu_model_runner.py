@@ -6511,8 +6511,18 @@ class GPUModelRunner(
             return
 
         max_m = self.scheduler_config.max_num_batched_tokens
-        m_values = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-        m_values = [m for m in m_values if m <= max_m]
+        m_values = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
+        m_values.add(max_m)
+
+        # CUDA graph capture does not use only power-of-two token counts. If we
+        # do not prewarm those exact sizes, B12X MoE compiles static kernels
+        # during capture and can leave GPUs idle while workers burn CPU.
+        for _, batch_descs in self.cudagraph_dispatcher.get_capture_descs():
+            for desc in batch_descs:
+                if desc.num_tokens > 0:
+                    m_values.add(int(desc.num_tokens))
+
+        m_values = sorted(m for m in m_values if m <= max_m)
 
         logger.info(
             "Pre-warming b12x MoE kernel cache via %s for m ∈ %s ...",
@@ -6646,12 +6656,281 @@ class GPUModelRunner(
         # §5 + §7 (carol). `0b735d2` reverted; the 89s of wasted init was
         # not worth keeping the dead-code path in production.
 
+    @torch.inference_mode()
+    def _prewarm_runtime_triton_kernel_cache(self) -> None:
+        """Compile small Triton helpers before the first real request.
+
+        These kernels are not covered reliably by `_dummy_run`: the block-table
+        slot-mapping path is normally driven by scheduler state, and the padded
+        MTP helper kernels only run after the target sampler has produced real
+        sampled-token tensors. If they first compile during a long prefill, all
+        GPUs can appear to pause while rank workers burn CPU in Triton/CUTE JIT.
+        """
+        if os.getenv("VLLM_PREFILL_TRITON_KERNEL_PREWARM", "1") != "1":
+            return
+
+        start = time.perf_counter()
+        warmed: list[str] = []
+
+        try:
+            query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
+            positions = torch.zeros(1, dtype=torch.int64, device=self.device)
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs=1,
+                query_start_loc=query_start_loc,
+                positions=positions,
+            )
+            warmed.append("_compute_slot_mapping_kernel")
+        except Exception as e:  # pragma: no cover - best-effort warmup
+            logger.warning(
+                "Runtime Triton prewarm: slot-mapping kernel warmup failed: %s",
+                e,
+            )
+
+        if (
+            self.speculative_config is not None
+            and self.num_spec_tokens > 0
+            and not self.speculative_config.disable_padded_drafter_batch
+        ):
+            try:
+                from vllm.v1.spec_decode.llm_base_proposer import (
+                    eagle_prepare_inputs_padded_kernel,
+                    eagle_prepare_next_token_padded_kernel,
+                )
+
+                # Runtime can call this helper with either the target sampler
+                # output width (1) or the full speculative sampled width
+                # (num_spec_tokens + 1). Warm both so the first real request
+                # does not compile while all TP workers wait.
+                sampled_widths = sorted({1, max(1, self.num_spec_tokens + 1)})
+                max_batch = min(max(1, self.scheduler_config.max_num_seqs), 64)
+                batch_sizes = [1, 2, 4, 8, 16, 32, 64]
+                batch_sizes = [bs for bs in batch_sizes if bs <= max_batch]
+                if max_batch not in batch_sizes:
+                    batch_sizes.append(max_batch)
+                for sampled_width in sampled_widths:
+                    block_size_tokens = 1 << (sampled_width - 1).bit_length()
+                    for batch_size in sorted(set(batch_sizes)):
+                        for token_id_dtype in (torch.int32, torch.int64):
+                            sampled_token_ids = torch.zeros(
+                                (batch_size, sampled_width),
+                                dtype=token_id_dtype,
+                                device=self.device,
+                            )
+                            discard_request_mask = torch.zeros(
+                                batch_size, dtype=torch.bool, device=self.device
+                            )
+                            backup_tokens = torch.zeros(
+                                batch_size, dtype=torch.int32, device=self.device
+                            )
+                            next_token_ids = torch.empty(
+                                batch_size, dtype=torch.int32, device=self.device
+                            )
+                            valid_sampled_tokens_count = torch.empty_like(
+                                next_token_ids
+                            )
+                            eagle_prepare_next_token_padded_kernel[(batch_size,)](
+                                sampled_token_ids,
+                                discard_request_mask,
+                                backup_tokens,
+                                next_token_ids,
+                                valid_sampled_tokens_count,
+                                self.input_batch.vocab_size,
+                                sampled_width,
+                                batch_size,
+                                sampled_token_ids.stride(0),
+                                BLOCK_SIZE_TOKENS=block_size_tokens,
+                            )
+                for batch_size in sorted(set(batch_sizes)):
+                    discard_request_mask = torch.zeros(
+                        batch_size, dtype=torch.bool, device=self.device
+                    )
+                    next_token_ids = torch.empty(
+                        batch_size, dtype=torch.int32, device=self.device
+                    )
+                    valid_sampled_tokens_count = torch.empty_like(next_token_ids)
+                    cu_num_draft_tokens = torch.zeros(
+                        batch_size + 1, dtype=torch.int32, device=self.device
+                    )
+                    query_start_loc = torch.arange(
+                        batch_size + 1, dtype=torch.int32, device=self.device
+                    )
+                    token_indices_to_sample = torch.empty_like(next_token_ids)
+                    num_rejected_tokens_gpu = torch.empty_like(next_token_ids)
+                    eagle_prepare_inputs_padded_kernel[(batch_size,)](
+                        cu_num_draft_tokens,
+                        valid_sampled_tokens_count,
+                        query_start_loc,
+                        token_indices_to_sample,
+                        num_rejected_tokens_gpu,
+                        batch_size,
+                    )
+                warmed.extend(
+                    [
+                        "eagle_prepare_next_token_padded_kernel",
+                        "eagle_prepare_inputs_padded_kernel",
+                    ]
+                )
+            except Exception as e:  # pragma: no cover - best-effort warmup
+                logger.warning(
+                    "Runtime Triton prewarm: padded spec-decode kernel warmup "
+                    "failed: %s",
+                    e,
+                )
+
+            try:
+                from vllm.v1.sample.rejection_sampler import (
+                    PLACEHOLDER_TOKEN_ID,
+                    rejection_greedy_sample_kernel,
+                )
+
+                max_spec_len = max(1, self.num_spec_tokens)
+                max_batch = min(max(1, self.scheduler_config.max_num_seqs), 64)
+                batch_sizes = [1, 2, 4, 8, 16, 32, 64]
+                batch_sizes = [bs for bs in batch_sizes if bs <= max_batch]
+                if max_batch not in batch_sizes:
+                    batch_sizes.append(max_batch)
+                for batch_size in sorted(set(batch_sizes)):
+                    num_tokens = batch_size * max_spec_len
+                    token_id_dtypes = (
+                        # Exact runtime greedy path: draft ids are int32 from
+                        # SamplerOutput, target_argmax is int64 from torch.argmax,
+                        # and bonus ids are int32.
+                        (torch.int32, torch.int64, torch.int32),
+                        # Keep symmetric variants covered for non-default sampler
+                        # paths and future small config changes.
+                        (torch.int32, torch.int32, torch.int32),
+                        (torch.int64, torch.int64, torch.int64),
+                    )
+                    for (
+                        draft_dtype,
+                        target_argmax_dtype,
+                        bonus_dtype,
+                    ) in token_id_dtypes:
+                        output_token_ids = torch.full(
+                            (batch_size, max_spec_len + 1),
+                            PLACEHOLDER_TOKEN_ID,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        cu_num_draft_tokens = torch.arange(
+                            max_spec_len,
+                            num_tokens + max_spec_len,
+                            max_spec_len,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        draft_token_ids = torch.zeros(
+                            num_tokens, dtype=draft_dtype, device=self.device
+                        )
+                        target_argmax = torch.zeros(
+                            num_tokens,
+                            dtype=target_argmax_dtype,
+                            device=self.device,
+                        )
+                        bonus_token_ids = torch.zeros(
+                            (batch_size, 1),
+                            dtype=bonus_dtype,
+                            device=self.device,
+                        )
+                        is_greedy = torch.ones(
+                            batch_size, dtype=torch.bool, device=self.device
+                        )
+                        rejection_greedy_sample_kernel[(batch_size,)](
+                            output_token_ids,
+                            cu_num_draft_tokens,
+                            draft_token_ids,
+                            target_argmax,
+                            bonus_token_ids,
+                            None,
+                            max_spec_len,
+                        )
+                        rejection_greedy_sample_kernel[(batch_size,)](
+                            output_token_ids,
+                            cu_num_draft_tokens,
+                            draft_token_ids,
+                            target_argmax,
+                            bonus_token_ids,
+                            is_greedy,
+                            max_spec_len,
+                        )
+                warmed.append("rejection_greedy_sample_kernel")
+            except Exception as e:  # pragma: no cover - best-effort warmup
+                logger.warning(
+                    "Runtime Triton prewarm: rejection sampler kernel warmup "
+                    "failed: %s",
+                    e,
+                )
+
+        if current_platform.is_cuda() and envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            try:
+                from b12x.integration.nsa_indexer import (
+                    get_paged_mqa_logits_metadata as b12x_get_metadata,
+                )
+
+                block_kv = int(self.vllm_config.cache_config.block_size or 64)
+                out = torch.empty(
+                    (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+                )
+                max_batch = min(max(1, self.scheduler_config.max_num_seqs), 256)
+                # The paged-MQA schedule kernel specializes on the actual
+                # scheduler batch shape. Prefix caching and MTP can produce
+                # non-power-of-two runtime batches (for example 10 rows for
+                # cc=5), so warm the exact small batch range rather than just
+                # powers of two.
+                if max_batch <= 64:
+                    batch_sizes = list(range(1, max_batch + 1))
+                else:
+                    batch_sizes = list(range(1, 65))
+                    batch_sizes.extend([128, 256])
+                    batch_sizes = [bs for bs in batch_sizes if bs <= max_batch]
+                    if max_batch not in batch_sizes:
+                        batch_sizes.append(max_batch)
+                for batch_size in sorted(set(batch_sizes)):
+                    lens_1d = torch.full(
+                        (batch_size,),
+                        max(1, min(int(self.max_model_len), 131072)),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    b12x_get_metadata(
+                        lens_1d,
+                        block_kv,
+                        self.num_sms,
+                        out=out,
+                    )
+                    lens_2d = lens_1d[:, None].expand(
+                        -1, max(1, self.uniform_decode_query_len)
+                    ).contiguous()
+                    b12x_get_metadata(
+                        lens_2d,
+                        block_kv,
+                        self.num_sms,
+                        out=out,
+                    )
+                warmed.append("_build_paged_mqa_schedule_triton")
+            except Exception as e:  # pragma: no cover - best-effort warmup
+                logger.warning(
+                    "Runtime Triton prewarm: B12X paged-MQA schedule warmup "
+                    "failed: %s",
+                    e,
+                )
+
+        if warmed:
+            torch.accelerator.synchronize()
+            logger.info(
+                "Runtime Triton kernel cache prewarm complete: warmed %s in %.1fs.",
+                warmed,
+                time.perf_counter() - start,
+            )
+
     def capture_model(self) -> int:
         # Pre-populate b12x CUTLASS DSL kernel cache before cudagraph
         # capture so that runtime shapes outside the captured set still
         # hit the cache (avoids per-step JIT compile overhead). See
         # _prewarm_b12x_moe_kernel_cache docstring.
         self._prewarm_b12x_moe_kernel_cache()
+        self._prewarm_runtime_triton_kernel_cache()
 
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
