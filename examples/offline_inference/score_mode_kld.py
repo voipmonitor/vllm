@@ -455,6 +455,12 @@ def main():
         help="Override vLLM max_num_seqs for profiling/scheduler sizing",
     )
     parser.add_argument(
+        "--cpu-offload-gb",
+        type=float,
+        default=None,
+        help="GiB of CPU offload per GPU passed to vLLM LLM",
+    )
+    parser.add_argument(
         "--hf-overrides",
         type=str,
         default=None,
@@ -523,6 +529,8 @@ def main():
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.max_num_seqs:
         llm_kwargs["max_num_seqs"] = args.max_num_seqs
+    if args.cpu_offload_gb is not None:
+        llm_kwargs["cpu_offload_gb"] = args.cpu_offload_gb
     if args.hf_overrides:
         llm_kwargs["hf_overrides"] = json.loads(args.hf_overrides)
     if args.enforce_eager:
