@@ -48,6 +48,9 @@ _B12X_MOE_FORCE_NVFP4 = os.getenv(
 _B12X_MOE_A16_MIN_LAYER = int(
     os.getenv("VLLM_B12X_MOE_A16_MIN_LAYER", "-1")
 )
+_B12X_MOE_A16_MAX_LAYER = int(
+    os.getenv("VLLM_B12X_MOE_A16_MAX_LAYER", "-1")
+)
 
 # ---------------------------------------------------------------------------
 # Per-device workspace pool (mirrors SGLang's pattern).
@@ -370,11 +373,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         ``B12X_MOE_FORCE_A16=1`` and its required alpha adjustment. Passing
         ``"nvfp4"`` is safe and forces the original activation-quantized path.
 
-        W4A16 bypasses NVFP4 activation quant/dequant. On GLM-5.1 NVFP4 this
-        is not quality-preserving in early MoE layers because the checkpoint's
-        activation scales encode a narrow calibrated FP4 envelope. The optional
-        layer gate lets us keep early layers on NVFP4 while still testing A16
-        in later layers where the numerical delta is much smaller.
+        W4A16 bypasses NVFP4 activation quant/dequant. The optional layer gate
+        lets us keep selected layers on NVFP4 while isolating A16 numerics to a
+        specific layer range during GLM-5.1 quality/debug runs.
         """
         if _B12X_MOE_FORCE_NVFP4:
             return "nvfp4"
@@ -388,6 +389,16 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 )
                 return None
             if self.layer_idx < _B12X_MOE_A16_MIN_LAYER:
+                return "nvfp4"
+        if _B12X_MOE_A16_MAX_LAYER >= 0 and _b12x_env_force_a16():
+            if self.layer_idx is None:
+                logger.warning_once(
+                    "VLLM_B12X_MOE_A16_MAX_LAYER is set, but layer index "
+                    "is unavailable for %s; keeping b12x default MoE mode.",
+                    self.layer_name,
+                )
+                return None
+            if self.layer_idx > _B12X_MOE_A16_MAX_LAYER:
                 return "nvfp4"
 
         if _b12x_env_force_a16() and not self._warned_global_a16:
