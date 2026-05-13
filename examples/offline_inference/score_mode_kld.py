@@ -443,6 +443,18 @@ def main():
         help="Override vLLM max_model_len (default: context_length * 2)",
     )
     parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Override vLLM max_num_batched_tokens for profiling/scheduler sizing",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Override vLLM max_num_seqs for profiling/scheduler sizing",
+    )
+    parser.add_argument(
         "--hf-overrides",
         type=str,
         default=None,
@@ -507,6 +519,10 @@ def main():
         llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
     if args.load_format:
         llm_kwargs["load_format"] = args.load_format
+    if args.max_num_batched_tokens:
+        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.max_num_seqs:
+        llm_kwargs["max_num_seqs"] = args.max_num_seqs
     if args.hf_overrides:
         llm_kwargs["hf_overrides"] = json.loads(args.hf_overrides)
     if args.enforce_eager:
