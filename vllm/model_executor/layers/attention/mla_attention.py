@@ -753,7 +753,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if self.impl.dcp_world_size > 1:
+                if fp8_attention and self.impl.supports_quant_query_input:
+                    assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+                    assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                    )
+                else:
+                    # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                    mqa_q = torch.cat((mqa_ql_nope, mqa_q_pe), dim=-1)
+                # mqa_q do allgather in head dim. For fp8 MLA this gathers the
+                # quantized query, matching the verified GLM DCP no-XML image.
+                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
@@ -761,12 +774,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
-            if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                mqa_q = torch.cat(mqa_q, dim=-1)
-                # mqa_q do allgather in head dim.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
             # call decode attn
             if not is_sparse_impl:

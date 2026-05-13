@@ -61,6 +61,8 @@ exec /opt/venv/bin/vllm serve "${MODEL}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --pipeline-parallel-size 1 \
   --decode-context-parallel-size "${DCP_SIZE}" \
+  --dcp-comm-backend "${DCP_COMM_BACKEND:-ag_rs}" \
+  --dcp-kv-cache-interleave-size "${DCP_KV_CACHE_INTERLEAVE_SIZE:-1}" \
   --enable-chunked-prefill \
   --enable-prefix-caching \
   --load-format fastsafetensors \
