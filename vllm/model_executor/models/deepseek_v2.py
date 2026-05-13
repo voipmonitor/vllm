@@ -1030,7 +1030,7 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = getattr(config, "index_topk", 0) > 0
 
         _skip_topk = False
         if self.is_v32:
@@ -1267,7 +1267,7 @@ class DeepseekV2Model(nn.Module):
         self.device = current_platform.device_type
 
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = getattr(config, "index_topk", 0) > 0
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1435,6 +1435,15 @@ class DeepseekV2Model(nn.Module):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+
+            if (
+                getattr(self.config, "index_topk", 0) <= 0
+                and ".self_attn.indexer." in name
+            ):
+                # Explicit dense-equivalent GLM/DeepSeek evaluation disables
+                # sparse indexer modules, so checkpoint-only indexer weights
+                # are intentionally unused.
+                continue
 
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)

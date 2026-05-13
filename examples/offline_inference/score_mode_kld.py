@@ -461,6 +461,28 @@ def main():
         help="GiB of CPU offload per GPU passed to vLLM LLM",
     )
     parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default=None,
+        help="Attention backend passed to vLLM LLM, e.g. FLASHINFER_MLA_SPARSE",
+    )
+    parser.add_argument(
+        "--moe-backend",
+        type=str,
+        default=None,
+        help="MoE backend passed to vLLM LLM, e.g. b12x or flashinfer_cutlass",
+    )
+    parser.add_argument(
+        "--dense-equivalent-index-topk",
+        type=int,
+        default=None,
+        help=(
+            "For sparse-MLA GLM/DeepSeek models, set index_topk=0 and use dense "
+            "MLA. This is valid only when context_length is <= the original "
+            "index_topk value supplied here."
+        ),
+    )
+    parser.add_argument(
         "--hf-overrides",
         type=str,
         default=None,
@@ -531,8 +553,20 @@ def main():
         llm_kwargs["max_num_seqs"] = args.max_num_seqs
     if args.cpu_offload_gb is not None:
         llm_kwargs["cpu_offload_gb"] = args.cpu_offload_gb
-    if args.hf_overrides:
-        llm_kwargs["hf_overrides"] = json.loads(args.hf_overrides)
+    if args.attention_backend:
+        llm_kwargs["attention_backend"] = args.attention_backend
+    if args.moe_backend:
+        llm_kwargs["moe_backend"] = args.moe_backend
+    hf_overrides = json.loads(args.hf_overrides) if args.hf_overrides else {}
+    if args.dense_equivalent_index_topk is not None:
+        if args.context_length > args.dense_equivalent_index_topk:
+            parser.error(
+                "--dense-equivalent-index-topk is only valid when "
+                "context_length <= the original index_topk"
+            )
+        hf_overrides["index_topk"] = 0
+    if hf_overrides:
+        llm_kwargs["hf_overrides"] = hf_overrides
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
     if args.disable_custom_all_reduce:
