@@ -1128,7 +1128,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             config = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
-        if quant_config is None:
+        # NextN/MTP callers may pass None deliberately for BF16 draft layers
+        # inside an otherwise modelopt_fp4 target checkpoint.
+        if quant_config is None and not is_nextn:
             quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
 
