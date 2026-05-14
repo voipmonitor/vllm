@@ -45,6 +45,15 @@ require_marker() {
   fi
 }
 
+reject_marker() {
+  local path="$1"
+  local marker="$2"
+  if grep -Fq "$marker" "$path"; then
+    echo "forbidden marker in $path: $marker" >&2
+    exit 1
+  fi
+}
+
 require_sha256() {
   local path="$1"
   local expected="$2"
@@ -109,8 +118,9 @@ require_marker "$mla_indexer" "seq_lens_cpu_upper_bound"
 # Kimi K2.6 launch defaults from the verified 2026-05-10 image.
 require_marker "$kimi_run" 'MODEL="${MODEL:-moonshotai/Kimi-K2.6}"'
 require_marker "$kimi_run" 'ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_MLA}"'
+require_marker "$kimi_run" 'MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"'
 require_marker "$kimi_run" "lightseekorg/kimi-k2.6-eagle3-mla"
-require_marker "$kimi_run" '"draft_attention_backend":"TRITON_MLA"'
+reject_marker "$kimi_run" '"draft_attention_backend":"TRITON_MLA"'
 
 # GLM launch defaults.
 require_marker "$glm_run" 'ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"'
@@ -118,8 +128,8 @@ require_marker "$glm_run" "lukealonso/GLM-5.1-NVFP4-MTP"
 require_marker "$glm_run" '"index_topk_pattern":"FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"'
 
 require_sha256 "$glm_mla" "1fa71fc3a934831077b90dea555254d68366371e5a3969766e79cfec222ce418"
-require_sha256 "$kimi_run" "4cc0484a6ab7a886aa9d8b82a761936edf4751f6b3fa323d9f988def3879f389"
-require_sha256 "$glm_run" "361a643f5ff11169d11e4ec77a01fa4d28030ed1c874c6a43b51dc72a151debf"
+require_sha256 "$kimi_run" "08b3d317be09c32bf2c68c2ba5f74f38ebed84e9c012c2a3213a45f7852ae0dc"
+require_sha256 "$glm_run" "1bd2eae9ae22534d96bc37f5ad7180bbe943cbd3fbf0c79f482b9a632a454f6a"
 
 installed_glm_mla="/opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py"
 if [[ -f "$installed_glm_mla" ]]; then
