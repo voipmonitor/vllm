@@ -1296,6 +1296,14 @@ class FusedMoEConfig:
     # cannot silently select one and drop the clamp.
     swiglu_limit: float | None = None
 
+    # This flag is used to disable the inplace optimization
+    # in MoE kernels. If this flag is True then the kernel
+    # should not be using inplace. If the flag is false, the
+    # kernel is free to use inplace or not.
+    disable_inplace: bool = True
+    layer_name: str | None = None
+    layer_idx: int | None = None
+
     def __post_init__(self):
         if self.dp_size > 1:
             logger.debug_once(
