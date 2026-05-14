@@ -36,7 +36,7 @@ DCP_SIZE="${DCP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_MLA}"
@@ -51,7 +51,7 @@ fi
 
 SPEC_ARGS=()
 if [[ "${KIMI_DISABLE_MTP:-0}" != "1" ]]; then
-  DEFAULT_SPEC_CONFIG='{"model":"lightseekorg/kimi-k2.6-eagle3-mla","method":"eagle3","num_speculative_tokens":3,"draft_kv_cache_dtype":"fp8","rejection_sample_method":"probabilistic"}'
+  DEFAULT_SPEC_CONFIG='{"model":"lightseekorg/kimi-k2.6-eagle3-mla","method":"eagle3","num_speculative_tokens":3,"draft_attention_backend":"TRITON_MLA","draft_kv_cache_dtype":"fp8","rejection_sample_method":"probabilistic"}'
   SPEC_CONFIG="${KIMI_SPEC_CONFIG:-${SPEC_CONFIG:-$DEFAULT_SPEC_CONFIG}}"
   SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
 fi
