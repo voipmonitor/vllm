@@ -338,6 +338,8 @@ class FusedMoE(PluggableLayer):
             swiglu_limit=swiglu_limit,
             # TODO: in_dtype == out_dtype?
             disable_inplace=disable_inplace() or shared_experts is not None,
+            layer_name=self.layer_name,
+            layer_idx=self.layer_id,
         )
         if self.moe_config.use_mori_kernels:
             assert self.rocm_aiter_fmoe_enabled, (
