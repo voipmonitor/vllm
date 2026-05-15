@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -240,6 +241,12 @@ def _b12x_env_force_a16() -> bool:
     )
 
 
+def _b12x_activation_name(activation: MoEActivation) -> str:
+    if activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI):
+        return "silu"
+    raise ValueError(f"B12X W4A16 MoE does not support activation {activation}")
+
+
 # ---------------------------------------------------------------------------
 # Expert implementation
 # ---------------------------------------------------------------------------
@@ -293,6 +300,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self.layer_name = moe_config.layer_name
         self.layer_idx = moe_config.layer_idx
         self._warned_global_a16 = False
+        self._w4a16_prepared = None
 
     # ------------------------------------------------------------------
     # process_weights_after_loading: fuse input scales into g{1,2}_alphas
@@ -312,6 +320,68 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 w13_input_scale = w13_input_scale[:, None]
             layer.w13_weight_scale_2.data.mul_(w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+
+        quant_mode_arg = self._select_quant_mode()
+        if not _b12x_env_force_a16() or quant_mode_arg == "nvfp4":
+            return
+
+        assert self.w1_scale is not None and self.w2_scale is not None, (
+            "w1_scale and w2_scale must not be None for B12xExperts"
+        )
+        assert self.g1_alphas is not None and self.g2_alphas is not None, (
+            "g1_alphas and g2_alphas must not be None for B12xExperts"
+        )
+        assert self.a1_gscale is not None and self.a2_gscale is not None, (
+            "a1_gscale and a2_gscale must not be None for B12xExperts"
+        )
+
+        from b12x.integration.tp_moe import _w4a16_default_alpha
+        from b12x.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
+
+        activation_name = _b12x_activation_name(layer.activation)
+        w1_alphas = _w4a16_default_alpha(
+            self.g1_alphas,
+            self.a1_gscale,
+            self.num_experts,
+        )
+        w2_alphas = _w4a16_default_alpha(
+            self.g2_alphas,
+            self.a2_gscale,
+            self.num_experts,
+        )
+        self._w4a16_prepared = prepare_w4a16_packed_weights(
+            layer.w13_weight,
+            self.w1_scale,
+            w1_alphas,
+            layer.w2_weight,
+            self.w2_scale,
+            w2_alphas,
+            activation=activation_name,
+            params_dtype=self.out_dtype,
+            source_format="modelopt",
+        )
+
+        # The direct W4A16 path owns the packed weights now. Drop the original
+        # NVFP4 tensors immediately so full GLM-5.1 does not keep both copies.
+        replace_parameter(
+            layer,
+            "w13_weight",
+            torch.empty(
+                (self.num_experts, 1, 1),
+                dtype=torch.uint8,
+                device=layer.w13_weight.device,
+            ),
+        )
+        replace_parameter(
+            layer,
+            "w2_weight",
+            torch.empty(
+                (self.num_experts, 1, 1),
+                dtype=torch.uint8,
+                device=layer.w2_weight.device,
+            ),
+        )
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Static capabilities
@@ -434,6 +504,37 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         output_shape = (M, K)
         return (workspace1, workspace2, output_shape)
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        if self._w4a16_prepared is None:
+            return super().moe_problem_size(a1, w1, w2, topk_ids)
+
+        if a1.dim() == 2:
+            assert topk_ids.size(0) == a1.size(0), (
+                f"{topk_ids.size(0)} != {a1.size(0)}"
+            )
+            M = a1.size(0)
+        else:
+            assert a1.dim() == 3
+            M = a1.size(1)
+        assert topk_ids.dim() == 2
+        topk = topk_ids.size(1)
+        w1_rows = int(self._w4a16_prepared.intermediate_size) * (
+            2 if self._w4a16_prepared.is_gated else 1
+        )
+        return (
+            int(self._w4a16_prepared.num_experts),
+            M,
+            w1_rows,
+            int(self._w4a16_prepared.hidden_size),
+            topk,
+        )
+
     # ------------------------------------------------------------------
     # apply -- the hot path
     # ------------------------------------------------------------------
@@ -466,6 +567,78 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
         workspace_pool = _get_b12x_workspace_pool(hidden_states.device)
+
+        if self._w4a16_prepared is not None:
+            from b12x.integration.tp_moe import (
+                TPW4A16Workspace,
+                _make_workspace_plan,
+                _resolve_workspace,
+            )
+            from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
+
+            activation_name = _b12x_activation_name(activation)
+            if topk_weights.dtype != torch.float32:
+                if torch.cuda.is_current_stream_capturing():
+                    raise ValueError(
+                        "CUDA graph capture requires float32 W4A16 topk_weights"
+                    )
+                topk_weights = topk_weights.float()
+            if not topk_weights.is_contiguous():
+                if torch.cuda.is_current_stream_capturing():
+                    raise ValueError(
+                        "CUDA graph capture requires contiguous W4A16 topk_weights"
+                    )
+                topk_weights = topk_weights.contiguous()
+            if not topk_ids.is_contiguous():
+                if torch.cuda.is_current_stream_capturing():
+                    raise ValueError(
+                        "CUDA graph capture requires contiguous W4A16 topk_ids"
+                    )
+                topk_ids = topk_ids.contiguous()
+
+            plan = _make_workspace_plan(
+                num_tokens=hidden_states.shape[0],
+                weight_E=int(self._w4a16_prepared.num_experts),
+                k=int(self._w4a16_prepared.hidden_size),
+                n=int(self._w4a16_prepared.intermediate_size),
+                num_topk=topk_ids.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+                quant_mode="w4a16",
+                activation=activation_name,
+            )
+            w4a16_workspace = _resolve_workspace(
+                workspace_pool,
+                plan=plan,
+                a1_gscale=self.a1_gscale,
+                a2_gscale=self.a2_gscale,
+                input_scales_static=True,
+            )
+            if not isinstance(w4a16_workspace, TPW4A16Workspace):
+                raise TypeError("expected a TPW4A16Workspace for B12X W4A16")
+
+            run_w4a16_moe(
+                hidden_states,
+                self._w4a16_prepared,
+                topk_weights,
+                topk_ids,
+                activation=activation_name,
+                apply_router_weight_on_input=(
+                    apply_router_weight_on_input
+                    if apply_router_weight_on_input is not None
+                    else False
+                ),
+                intermediate_cache13=w4a16_workspace.intermediate_cache13,
+                intermediate_cache2=w4a16_workspace.intermediate_cache2,
+                output=output,
+                fc1_c_tmp=w4a16_workspace.fc1_c_tmp,
+                fc2_c_tmp=w4a16_workspace.fc2_c_tmp,
+                packed_route_indices=w4a16_workspace.packed_route_indices,
+                block_expert_ids=w4a16_workspace.block_expert_ids,
+                packed_route_count=w4a16_workspace.packed_route_count,
+                expert_offsets=w4a16_workspace.expert_offsets,
+            )
+            return
 
         _b12x_moe_fp4_pad_m(
             a=hidden_states,
