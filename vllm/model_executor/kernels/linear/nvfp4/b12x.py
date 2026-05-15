@@ -46,6 +46,76 @@ def _next_pow2_ge(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+@torch.library.custom_op(
+    "vllm_b12x::nvfp4_dense_gemm", mutates_args=(), device_types="cuda"
+)
+def _b12x_nvfp4_dense_gemm(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_global_scale_inv: torch.Tensor,
+    alpha: torch.Tensor,
+    output_size: int,
+    pad_m_to_pow2: bool,
+) -> torch.Tensor:
+    orig_m = x_2d.shape[0]
+    m = orig_m
+    x_2d = x_2d.contiguous()
+    if pad_m_to_pow2:
+        # b12x dense_gemm currently faults on decode-style M=1 shapes
+        # (for example Kimi EAGLE3 q_b_proj: M=1, N=1536, K=1536).
+        # Pad all small-M launches to at least 2 rows before the existing
+        # power-of-two padding path and slice the extra rows after GEMM.
+        padded_m = max(2, _next_pow2_ge(orig_m))
+        if padded_m != orig_m:
+            x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, padded_m - orig_m))
+            m = padded_m
+
+    fp4 = _import_b12x_fp4()
+    dense = _import_b12x_dense()
+    if fp4 is None or dense is None:
+        raise ImportError("b12x is not installed or importable")
+
+    x_packed, x_scale_swizzled = scaled_fp4_quant(
+        x_2d,
+        input_global_scale_inv,
+        is_sf_swizzled_layout=True,
+        backend="cutlass",
+    )
+    x_scale = fp4.as_grouped_scale_view(
+        x_scale_swizzled.view(torch.uint8).unsqueeze(0),
+        m,
+        x_2d.shape[1],
+    )
+
+    out = torch.empty((m, output_size, 1), device=x_2d.device, dtype=x_2d.dtype)
+    dense.dense_gemm(
+        (x_packed.unsqueeze(-1), x_scale),
+        (weight.unsqueeze(-1), weight_scale.unsqueeze(-1)),
+        out=out,
+        alpha=alpha,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype=str(x_2d.dtype).split(".")[-1],
+        sf_vec_size=16,
+    )
+    return out[:orig_m, :, 0]
+
+
+@_b12x_nvfp4_dense_gemm.register_fake
+def _(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_global_scale_inv: torch.Tensor,
+    alpha: torch.Tensor,
+    output_size: int,
+    pad_m_to_pow2: bool,
+) -> torch.Tensor:
+    del weight, weight_scale, input_global_scale_inv, alpha, pad_m_to_pow2
+    return x_2d.new_empty((x_2d.shape[0], output_size))
+
+
 class B12xNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 GEMM via the optional external b12x SM12x backend."""
 
@@ -93,39 +163,16 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
         output_dtype = x.dtype
         output_shape = [*x.shape[:-1], output_size]
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-        orig_m = x_2d.shape[0]
-        m = orig_m
-        if _B12X_PAD_M_TO_POW2 and orig_m > 1:
-            padded_m = _next_pow2_ge(orig_m)
-            if padded_m != orig_m:
-                x_2d = torch.nn.functional.pad(
-                    x_2d, (0, 0, 0, padded_m - orig_m)
-                )
-                m = padded_m
-        x_packed, x_scale_swizzled = scaled_fp4_quant(
+        out = _b12x_nvfp4_dense_gemm(
             x_2d,
+            layer.weight,
+            layer.weight_scale,
             layer.input_global_scale_inv,
-            is_sf_swizzled_layout=True,
-            backend="cutlass",
+            layer.alpha,
+            output_size,
+            _B12X_PAD_M_TO_POW2,
         )
-        x_scale = self._as_grouped_scale_view(
-            x_scale_swizzled.view(torch.uint8).unsqueeze(0),
-            m,
-            x_2d.shape[1],
-        )
-
-        out = torch.empty((m, output_size, 1), device=x.device, dtype=output_dtype)
-        self._dense_gemm(
-            (x_packed.unsqueeze(-1), x_scale),
-            (layer.weight.unsqueeze(-1), layer.weight_scale.unsqueeze(-1)),
-            out=out,
-            alpha=layer.alpha,
-            ab_dtype="float4_e2m1fn",
-            sf_dtype="float8_e4m3fn",
-            c_dtype=str(output_dtype).split(".")[-1],
-            sf_vec_size=16,
-        )
-        out = out[:orig_m, :, 0]
+        assert out.dtype == output_dtype
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
