@@ -201,12 +201,15 @@ def _reshape_kv_cache(
                 has_attn = True
                 num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                cache_dtype_str = (
+                    getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
+                )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=cache_dtype_str,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
