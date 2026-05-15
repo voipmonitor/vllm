@@ -51,12 +51,21 @@ _B12X_MOE_A16_MIN_LAYER = int(
 _B12X_MOE_A16_MAX_LAYER = int(
     os.getenv("VLLM_B12X_MOE_A16_MAX_LAYER", "-1")
 )
+_B12X_MOE_IMPL = os.getenv("VLLM_B12X_MOE_IMPL", "b12x").lower()
+_B12X_MOE_USE_FLASHINFER = _B12X_MOE_IMPL in ("flashinfer", "fi")
+_FLASHINFER_B12X_ACTIVATION_PRECISION = os.getenv(
+    "VLLM_FLASHINFER_B12X_ACTIVATION_PRECISION", ""
+).lower()
 
 # ---------------------------------------------------------------------------
 # Per-device workspace pool (mirrors SGLang's pattern).
 # The pool is stream-aware inside b12x, so one pool per device suffices.
 # ---------------------------------------------------------------------------
 _B12X_MOE_WORKSPACE_POOLS: dict[int, Any] = {}
+_FLASHINFER_SCALE_MMA_CACHE: dict[
+    tuple[int, tuple[int, ...], tuple[int, ...], torch.dtype, int, int, int],
+    torch.Tensor,
+] = {}
 
 
 # Resolve the new shared-arena workspace API ONCE at module load. Repeating the
@@ -231,6 +240,16 @@ def _has_b12x() -> bool:
         return False
 
 
+def _has_flashinfer_b12x() -> bool:
+    """Return True when FlashInfer's native B12X MoE API is importable."""
+    try:
+        from flashinfer.fused_moe import b12x_fused_moe  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def _b12x_env_force_a16() -> bool:
     return os.getenv("B12X_MOE_FORCE_A16", "0") not in (
         "",
@@ -238,6 +257,69 @@ def _b12x_env_force_a16() -> bool:
         "false",
         "False",
     )
+
+
+def _flashinfer_b12x_activation_precision() -> str:
+    if _FLASHINFER_B12X_ACTIVATION_PRECISION:
+        if _FLASHINFER_B12X_ACTIVATION_PRECISION not in ("fp4", "bf16"):
+            raise ValueError(
+                "VLLM_FLASHINFER_B12X_ACTIVATION_PRECISION must be "
+                "'fp4' or 'bf16', got "
+                f"{_FLASHINFER_B12X_ACTIVATION_PRECISION!r}"
+            )
+        return _FLASHINFER_B12X_ACTIVATION_PRECISION
+    if _B12X_MOE_FORCE_NVFP4:
+        return "fp4"
+    return "bf16" if _b12x_env_force_a16() else "fp4"
+
+
+def _flashinfer_activation_name(activation: MoEActivation) -> str:
+    if activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI):
+        return "silu"
+    raise ValueError(f"FlashInfer B12X MoE does not support {activation}")
+
+
+def _flashinfer_scale_to_mma(
+    scale: torch.Tensor,
+    *,
+    m: int,
+    k: int,
+    num_groups: int,
+) -> torch.Tensor:
+    """Convert B12X's 3D swizzled scale tensor to FlashInfer's 6D view."""
+    if scale.ndim == 6:
+        return scale
+    if scale.ndim != 3:
+        raise ValueError(
+            "FlashInfer B12X MoE expects 3D swizzled or 6D MMA scale "
+            f"tensors, got shape={tuple(scale.shape)}"
+        )
+
+    key = (
+        scale.data_ptr(),
+        tuple(scale.shape),
+        tuple(scale.stride()),
+        scale.dtype,
+        m,
+        k,
+        num_groups,
+    )
+    cached = _FLASHINFER_SCALE_MMA_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    scale_flat = scale.reshape(num_groups * scale.shape[1], scale.shape[2])
+    scale_mma = convert_sf_to_mma_layout(
+        scale_flat,
+        m=m,
+        k=k,
+        num_groups=num_groups,
+        sf_vec_size=16,
+    )
+    _FLASHINFER_SCALE_MMA_CACHE[key] = scale_mma
+    return scale_mma
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +401,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
+        has_kernel = (
+            _has_flashinfer_b12x() if _B12X_MOE_USE_FLASHINFER else _has_b12x()
+        )
         return (
             p.is_cuda()
             and p.is_device_capability_family(120)
-            and _has_b12x()
+            and has_kernel
         )
 
     @staticmethod
@@ -464,6 +549,49 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         assert self.a1_gscale is not None and self.a2_gscale is not None, (
             "a1_gscale and a2_gscale must not be None for B12xExperts"
         )
+
+        if _B12X_MOE_USE_FLASHINFER:
+            from flashinfer.fused_moe import b12x_fused_moe
+
+            if apply_router_weight_on_input:
+                raise NotImplementedError(
+                    "FlashInfer B12X MoE path does not support "
+                    "apply_router_weight_on_input=True"
+                )
+
+            w1_scale = _flashinfer_scale_to_mma(
+                self.w1_scale,
+                m=w1.shape[1],
+                k=w1.shape[2] * 2,
+                num_groups=w1.shape[0],
+            )
+            w2_scale = _flashinfer_scale_to_mma(
+                self.w2_scale,
+                m=w2.shape[1],
+                k=w2.shape[2] * 2,
+                num_groups=w2.shape[0],
+            )
+
+            b12x_fused_moe(
+                x=hidden_states,
+                w1_weight=w1,
+                w1_weight_sf=w1_scale,
+                w2_weight=w2,
+                w2_weight_sf=w2_scale,
+                token_selected_experts=topk_ids.to(torch.int32),
+                token_final_scales=topk_weights.float(),
+                num_experts=global_num_experts,
+                top_k=topk_ids.shape[-1],
+                w1_alpha=self.g1_alphas,
+                w2_alpha=self.g2_alphas,
+                fc2_input_scale=self.a2_gscale,
+                num_local_experts=self.num_experts,
+                output=output,
+                output_dtype=self.out_dtype,
+                activation=_flashinfer_activation_name(activation),
+                activation_precision=_flashinfer_b12x_activation_precision(),
+            )
+            return
 
         workspace_pool = _get_b12x_workspace_pool(hidden_states.device)
 

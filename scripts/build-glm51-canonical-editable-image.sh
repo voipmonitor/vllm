@@ -76,7 +76,28 @@ PY
 
 docker commit \
   --change 'ENV PYTHONPATH=/opt/vllm' \
-  --change 'ENTRYPOINT ["/usr/local/bin/run-glm51-vllm"]' \
+  --change 'ENTRYPOINT ["/bin/bash"]' \
+  --change 'CMD ["-lc","sleep infinity"]' \
+  --change 'ENV HF_OVERRIDES=' \
+  --change 'ENV SPEC_CONFIG=' \
+  --change 'ENV KIMI_SPEC_CONFIG=' \
+  --change 'ENV MODEL=' \
+  --change 'ENV SERVED_MODEL_NAME=' \
+  --change 'ENV PORT=' \
+  --change 'ENV DCP_SIZE=' \
+  --change 'ENV TP_SIZE=' \
+  --change 'ENV GPU_MEMORY_UTILIZATION=' \
+  --change 'ENV MAX_MODEL_LEN=' \
+  --change 'ENV MAX_NUM_BATCHED_TOKENS=' \
+  --change 'ENV MAX_NUM_SEQS=' \
+  --change 'ENV MAX_CUDAGRAPH_CAPTURE_SIZE=' \
+  --change 'ENV MOE_BACKEND=' \
+  --change 'ENV ATTENTION_BACKEND=' \
+  --change 'ENV KV_CACHE_DTYPE=' \
+  --change 'ENV GLM51_DISABLE_MTP=' \
+  --change 'ENV KIMI_DISABLE_MTP=' \
+  --change 'ENV B12X_MOE_FORCE_A16=' \
+  --change 'ENV VLLM_USE_B12X_SPARSE_INDEXER=' \
   --change "LABEL voipmonitor.vllm.git_sha=${VLLM_GIT_SHA}" \
   --change "LABEL voipmonitor.vllm.install=editable-rebuilt-sm120a-maxjobs${MAX_JOBS}" \
   --change "LABEL voipmonitor.b12x.git_sha=${B12X_GIT_SHA}" \
