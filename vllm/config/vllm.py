@@ -2003,6 +2003,10 @@ class VllmConfig:
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
 
+        # Reasoning parsers are an OpenAI serving-layer feature and are safe to
+        # use with ModelRunnerV2. The unsupported part is per-request reasoning
+        # budget enforcement, which is rejected in the V1 input processor when
+        # a request sets thinking_token_budget.
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 
