@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -304,6 +305,79 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 installed,
             )
 
+    def _preload_b12x_w4a16_packed_weights(self) -> None:
+        if os.getenv("VLLM_B12X_W4A16_PACKED_WEIGHT_PRELOAD", "1") == "0":
+            return
+        kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
+        moe_backend = str(getattr(kernel_cfg, "moe_backend", "") or "").lower()
+        if kernel_cfg is None or moe_backend != "b12x":
+            return
+        if os.getenv("B12X_MOE_FORCE_A16", "0") in ("", "0", "false", "False"):
+            return
+        if os.getenv("VLLM_B12X_MOE_FORCE_NVFP4", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        ):
+            return
+
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        models: list[tuple[str, nn.Module | None]] = [("model", self.model)]
+        speculator = getattr(self, "speculator", None)
+        models.append(("speculator", getattr(speculator, "model", None)))
+
+        seen_roots: set[int] = set()
+        seen_layers: set[int] = set()
+        preloaded = 0
+        start = time.perf_counter()
+        for root_name, root in models:
+            if root is None or id(root) in seen_roots:
+                continue
+            seen_roots.add(id(root))
+            for module_name, module in root.named_modules():
+                if not isinstance(module, FusedMoE) or id(module) in seen_layers:
+                    continue
+                seen_layers.add(id(module))
+                hidden_states = torch.zeros(
+                    1,
+                    int(module.hidden_size),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                router_logits = torch.zeros(
+                    1,
+                    int(module.global_num_experts),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                with (
+                    torch.inference_mode(),
+                    set_forward_context(
+                        attn_metadata=None,
+                        vllm_config=self.vllm_config,
+                        num_tokens=1,
+                    ),
+                ):
+                    module(hidden_states, router_logits)
+                del hidden_states, router_logits
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                preloaded += 1
+                logger.debug(
+                    "Preloaded b12x W4A16 packed weights for %s.%s.",
+                    root_name,
+                    module_name,
+                )
+
+        if preloaded:
+            logger.info(
+                "Preloaded b12x W4A16 packed weights for %d MoE layers in %.1fs.",
+                preloaded,
+                time.perf_counter() - start,
+            )
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
         if load_dummy_weights:
@@ -332,6 +406,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             if not load_dummy_weights:
                 self._preinstall_b12x_joint_attention_arenas()
+                self._preload_b12x_w4a16_packed_weights()
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
