@@ -962,6 +962,17 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             return None
         if self._moe_backend_name(self.vllm_config) != "b12x":
             return None
+        if (
+            os.getenv("B12X_MOE_FORCE_A16", "0")
+            not in ("", "0", "false", "False")
+            and os.getenv("VLLM_B12X_MOE_FORCE_NVFP4", "0")
+            in ("", "0", "false", "False")
+        ):
+            logger.warning_once(
+                "B12X W4A16 MoE uses its own workspace planner; skipping "
+                "MoE capacity reservation in the B12X joint attention arena."
+            )
+            return None
 
         try:
             from b12x.integration import B12XMoEArenaCaps
