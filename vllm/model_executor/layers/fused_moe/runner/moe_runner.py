@@ -669,7 +669,7 @@ class MoERunner(MoERunnerInterface):
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            result = shared_output.add_(fused_output)
         else:
             result = fused_output
 

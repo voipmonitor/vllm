@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from functools import cache
 from importlib.util import find_spec
+import os
 
 from vllm.platforms.interface import DeviceCapability
 
@@ -29,6 +30,56 @@ def is_b12x_sparse_mla_available() -> bool:
         return find_spec("b12x.integration.mla") is not None
     except (ImportError, ValueError):
         return False
+
+
+@cache
+def is_b12x_moe_available() -> bool:
+    try:
+        return find_spec("b12x.integration.tp_moe") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _normalized_backend_name(value: object | None) -> str:
+    return str(value or "").lower().replace("-", "_")
+
+
+def b12x_moe_backend_selected_for_config(vllm_config: object | None) -> bool:
+    """Return whether vLLM will use the B12X NVFP4 MoE backend.
+
+    The NVFP4 MoE oracle tries B12X first when `moe_backend=auto` and B12X is
+    available. The sparse MLA arena code must mirror that selection; otherwise
+    target attention and MoE disagree about whether a shared execution lane is
+    required.
+    """
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    moe_backend = _normalized_backend_name(
+        getattr(kernel_config, "moe_backend", None)
+    )
+    if moe_backend == "b12x":
+        return True
+    if moe_backend not in ("", "auto"):
+        return False
+
+    env_backend = _normalized_backend_name(os.getenv("MOE_BACKEND"))
+    if env_backend:
+        return env_backend == "b12x"
+
+    if _env_truthy("VLLM_USE_FLASHINFER_MOE_FP4"):
+        return False
+
+    return is_b12x_moe_available()
 
 
 def _iter_config_candidates(config: object | None) -> Iterable[object]:
@@ -183,9 +234,7 @@ def b12x_backend_active_for_config(
         allow_draft_wrapper=allow_draft_wrapper,
     ):
         return True
-    kernel_config = getattr(vllm_config, "kernel_config", None)
-    moe_backend = getattr(kernel_config, "moe_backend", None)
-    return str(moe_backend).lower() == "b12x"
+    return b12x_moe_backend_selected_for_config(vllm_config)
 
 
 def b12x_sparse_indexer_active_for_config(
