@@ -489,6 +489,7 @@ class CustomAllreduce:
         It records all the buffer addresses used in the CUDA graph.
         """
         old_pcie_capture_stream = self._pcie_capture_stream
+        capture_succeeded = False
         try:
             self._IS_CAPTURING = True
             if self._pcie_runtime is None:
@@ -497,10 +498,11 @@ class CustomAllreduce:
                 self._pcie_capture_stream = stream
                 with self._pcie_runtime.capture(stream=stream):
                     yield
+            capture_succeeded = True
         finally:
             self._pcie_capture_stream = old_pcie_capture_stream
             self._IS_CAPTURING = False
-            if not self.disabled and self._pcie_runtime is None:
+            if capture_succeeded and not self.disabled and self._pcie_runtime is None:
                 self.register_graph_buffers()
 
     def _pcie_runtime_stream(self) -> torch.cuda.Stream | None:
@@ -635,6 +637,13 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if self._pcie_cpp_backend:
+                    # CUDA graph pool input allocations are not a stable
+                    # cross-process IPC contract for replay on PCIe topologies.
+                    # Capture the same pre-registered staging-buffer path used
+                    # by eager execution, keeping C++ custom AR enabled without
+                    # registering graph-private input tensors as peer buffers.
+                    return self.all_reduce(input, registered=False)
                 return self.all_reduce(input, registered=True)
             else:
                 # Piecewise CUDA graph execution can run split ops eagerly while

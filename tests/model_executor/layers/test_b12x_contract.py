@@ -14,6 +14,7 @@ from vllm.config import CUDAGraphMode
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.b12x_contract import (
     b12x_backend_active_for_config,
+    b12x_moe_backend_selected_for_config,
     b12x_sparse_indexer_active_for_config,
     b12x_sparse_mla_active_for_config,
 )
@@ -151,6 +152,41 @@ def test_b12x_joint_arena_preinstall_normalizes_moe_backend():
     runner = object.__new__(GPUModelRunner)
     runner.vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend="B12X"),
+    )
+    runner.model = FakeModel()
+
+    GPUModelRunner._preinstall_b12x_joint_attention_arenas(runner)
+
+    assert calls == ["preinstall"]
+
+
+def test_b12x_moe_backend_selected_for_auto_env(monkeypatch):
+    monkeypatch.setenv("MOE_BACKEND", "b12x")
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="auto"),
+    )
+
+    assert b12x_moe_backend_selected_for_config(vllm_config)
+
+
+def test_b12x_joint_arena_preinstall_auto_env_b12x(monkeypatch):
+    monkeypatch.setenv("MOE_BACKEND", "b12x")
+    calls = []
+
+    class FakeModule:
+
+        impl = SimpleNamespace(
+            _preinstall_b12x_joint_arena=lambda: calls.append("preinstall")
+        )
+
+    class FakeModel:
+
+        def named_modules(self):
+            return [("model.layers.0.self_attn", FakeModule())]
+
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="auto"),
     )
     runner.model = FakeModel()
 

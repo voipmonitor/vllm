@@ -113,6 +113,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: CPTritonContext,
     is_lse_base_on_e: bool = True,
+    lse_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -153,9 +154,27 @@ def correct_attn_out(
 
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
     # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
-    lse = torch.empty_strided(
-        (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
-    )
+    # CUDA graph hot paths can pass a preallocated buffer with the same layout
+    # to avoid capturing a fresh allocator-owned tensor in the graph body.
+    if lse_out is None:
+        lse = torch.empty_strided(
+            (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
+        )
+    else:
+        if (
+            lse_out.device != lses.device
+            or lse_out.dtype != lses.dtype
+            or lse_out.shape[0] < B
+            or lse_out.shape[1] < H
+            or lse_out.stride(0) != l_sB
+            or lse_out.stride(1) != l_sH
+        ):
+            raise RuntimeError(
+                "preallocated DCP LSE buffer does not match gathered LSE layout: "
+                f"lse_out shape={tuple(lse_out.shape)} stride={lse_out.stride()} "
+                f"expected at least ({B}, {H}) stride=({l_sB}, {l_sH})"
+            )
+        lse = lse_out[:B, :H]
 
     # Kernel launch config
     grid = (B, H, 1)

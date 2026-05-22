@@ -194,6 +194,7 @@ from enum import Enum
 from typing import ClassVar, Generic, TypeVar, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from tqdm import tqdm
 
@@ -268,7 +269,11 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.common import (
+    CPTritonContext,
+    correct_attn_out,
+    cp_lse_ag_out_rs,
+)
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
@@ -281,6 +286,197 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _dcp_all_gather_heads_into_buffer(
+    input_: torch.Tensor,
+    local_buffer: torch.Tensor | None,
+    output_buffer: torch.Tensor | None,
+    rank_major_buffer: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Gather DCP head shards into a preallocated [B, world * H, D] buffer.
+
+    GroupCoordinator.all_gather(dim=1) gathers into a [world * B, H, D]
+    tensor and then reshapes/movedims it into [B, world * H, D]. That final
+    reshape can allocate a second full gathered tensor. Long-context DCP MLA
+    runs close enough to the memory limit that this transient copy can OOM.
+    """
+    if local_buffer is None or output_buffer is None or rank_major_buffer is None:
+        return None
+    if input_.dim() != 3:
+        return None
+    dcp_group = get_dcp_group()
+    world_size = int(dcp_group.world_size)
+    if world_size <= 1:
+        return input_
+
+    batch, local_heads, head_dim = input_.shape
+    total_heads = local_heads * world_size
+    if (
+        local_buffer.device != input_.device
+        or local_buffer.dtype != input_.dtype
+        or local_buffer.dim() != 3
+        or local_buffer.shape[0] < batch
+        or local_buffer.shape[1] < local_heads
+        or local_buffer.shape[2] < head_dim
+        or output_buffer.device != input_.device
+        or output_buffer.dtype != input_.dtype
+        or output_buffer.dim() != 3
+        or output_buffer.shape[0] < batch
+        or output_buffer.shape[1] < total_heads
+        or output_buffer.shape[2] < head_dim
+    ):
+        return None
+    if (
+        rank_major_buffer.device != input_.device
+        or rank_major_buffer.dtype != input_.dtype
+        or rank_major_buffer.dim() != 3
+        or rank_major_buffer.shape[0] < batch * world_size
+        or rank_major_buffer.shape[1] < local_heads
+        or rank_major_buffer.shape[2] < head_dim
+    ):
+        return None
+
+    local = local_buffer[:batch, :local_heads, :head_dim]
+    gathered = output_buffer[:batch, :total_heads, :head_dim]
+    rank_major = rank_major_buffer[: batch * world_size, :local_heads, :head_dim]
+    if not local.is_contiguous() or not rank_major.is_contiguous():
+        return None
+    local.copy_(input_)
+    device_communicator = getattr(dcp_group, "device_communicator", None)
+    pynccl_comm = getattr(device_communicator, "pynccl_comm", None)
+    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", True):
+        pynccl_comm.all_gather(rank_major, local)
+    else:
+        dist.all_gather_into_tensor(
+            rank_major, local, group=dcp_group.device_group
+        )
+    rank_major = rank_major.view(world_size, batch, local_heads, head_dim)
+    for rank in range(world_size):
+        gathered[:, rank * local_heads : (rank + 1) * local_heads, :].copy_(
+            rank_major[rank]
+        )
+    return gathered
+
+
+def _dcp_lse_ag_out_rs_into_buffer(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: object,
+    lse_local_buffer: torch.Tensor | None,
+    lse_gather_buffer: torch.Tensor | None,
+    lse_output_buffer: torch.Tensor | None,
+    rs_input_buffer: torch.Tensor | None,
+    rs_rank_output_buffer: torch.Tensor | None,
+    rs_output_buffer: torch.Tensor | None,
+    ctx: CPTritonContext | None = None,
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor | None:
+    """DCP LSE correction + reduce-scatter without runtime layout allocations."""
+    world_size = int(getattr(cp_group, "world_size", 1))
+    if world_size <= 1:
+        return cp_attn_out
+    if (
+        cp_attn_out.dim() != 3
+        or rs_input_buffer is None
+        or rs_rank_output_buffer is None
+        or rs_output_buffer is None
+        or lse_local_buffer is None
+        or lse_gather_buffer is None
+        or lse_output_buffer is None
+    ):
+        return None
+
+    batch, total_heads, head_dim = cp_attn_out.shape
+    if total_heads % world_size != 0:
+        return None
+    local_heads = total_heads // world_size
+    buffers = (rs_input_buffer, rs_rank_output_buffer, rs_output_buffer)
+    if any(buf.device != cp_attn_out.device for buf in buffers):
+        return None
+    if any(buf.dtype != cp_attn_out.dtype for buf in buffers):
+        return None
+    lse_buffers = (lse_local_buffer, lse_gather_buffer, lse_output_buffer)
+    if any(buf.device != cp_attn_lse.device for buf in lse_buffers):
+        return None
+    if any(buf.dtype != cp_attn_lse.dtype for buf in lse_buffers):
+        return None
+    if (
+        rs_input_buffer.dim() != 3
+        or rs_input_buffer.shape[0] < batch * world_size
+        or rs_input_buffer.shape[1] < local_heads
+        or rs_input_buffer.shape[2] < head_dim
+        or rs_rank_output_buffer.dim() != 3
+        or rs_rank_output_buffer.shape[0] < batch
+        or rs_rank_output_buffer.shape[1] < local_heads
+        or rs_rank_output_buffer.shape[2] < head_dim
+        or rs_output_buffer.dim() != 3
+        or rs_output_buffer.shape[0] < batch
+        or rs_output_buffer.shape[1] < local_heads
+        or rs_output_buffer.shape[2] < head_dim
+        or cp_attn_lse.dim() != 2
+        or cp_attn_lse.shape[0] != batch
+        or cp_attn_lse.shape[1] != total_heads
+        or lse_local_buffer.dim() != 2
+        or lse_local_buffer.shape[0] < batch
+        or lse_local_buffer.shape[1] < total_heads
+        or lse_gather_buffer.dim() != 2
+        or lse_gather_buffer.shape[0] < batch * world_size
+        or lse_gather_buffer.shape[1] < total_heads
+        or lse_output_buffer.dim() != 2
+        or lse_output_buffer.shape[0] < batch
+        or lse_output_buffer.shape[1] < total_heads
+    ):
+        return None
+
+    rs_input = rs_input_buffer[: batch * world_size, :local_heads, :head_dim]
+    rs_rank_output = rs_rank_output_buffer[:batch, :local_heads, :head_dim]
+    rs_output = rs_output_buffer[:batch, :local_heads, :head_dim]
+    lse_local = lse_local_buffer[:batch, :total_heads]
+    lse_rank_major = lse_gather_buffer[: batch * world_size, :total_heads]
+    lse_output = lse_output_buffer[:batch, :total_heads]
+    if not rs_input.is_contiguous() or not rs_rank_output.is_contiguous():
+        return None
+    if (
+        not lse_local.is_contiguous()
+        or not lse_rank_major.is_contiguous()
+        or not lse_output.is_contiguous()
+    ):
+        return None
+
+    if ctx is None:
+        ctx = CPTritonContext()
+    lse_local.copy_(cp_attn_lse)
+    device_communicator = getattr(cp_group, "device_communicator", None)
+    pynccl_comm = getattr(device_communicator, "pynccl_comm", None)
+    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", True):
+        pynccl_comm.all_gather(lse_rank_major, lse_local)
+    else:
+        dist.all_gather_into_tensor(
+            lse_rank_major, lse_local, group=cp_group.device_group  # type: ignore[attr-defined]
+        )
+    lses = lse_rank_major.view(world_size, batch, total_heads)
+    out, _ = correct_attn_out(
+        cp_attn_out,
+        lses,
+        int(getattr(cp_group, "rank_in_group", 0)),
+        ctx,
+        is_lse_base_on_e=is_lse_base_on_e,
+        lse_out=lse_output,
+    )
+
+    for rank in range(world_size):
+        src = out[:, rank * local_heads : (rank + 1) * local_heads, :]
+        rs_input[rank * batch : (rank + 1) * batch, :, :].copy_(src)
+
+    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", True):
+        pynccl_comm.reduce_scatter(rs_rank_output, rs_input)
+    else:
+        dist.reduce_scatter_tensor(
+            rs_rank_output, rs_input, group=cp_group.device_group  # type: ignore[attr-defined]
+        )
+    rs_output.copy_(rs_rank_output)
+    return rs_output
 
 
 def _detect_output_quant_key(
@@ -635,19 +831,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 device=output.device,
             )
 
+        # Sparse MLA implementations route all tokens through forward_mqa and
+        # manage their own backend workspace. The dense prefill scratch below
+        # only reflects the non-sparse forward_mha/_compute_prefill_context path.
+        is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
+
         if attn_metadata is None:
             # During the profile run try to simulate to worse case output size
             # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
             # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            if not is_sparse_impl:
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
@@ -672,9 +874,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
-
-        # Sparse MLA impls only support forward_mqa (decode-style attention)
-        is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
 
         if is_sparse_impl:
             num_mqa_tokens = q.size(0)
@@ -764,9 +963,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 else:
                     # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                     mqa_q = torch.cat((mqa_ql_nope, mqa_q_pe), dim=-1)
-                # mqa_q do allgather in head dim. For fp8 MLA this gathers the
-                # quantized query, matching the verified GLM DCP no-XML image.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                # Gather DCP head shards without the generic dim=1 reshape copy.
+                # B12X sparse MLA provides a graph-stable buffer sized for the
+                # fully gathered query; falling back preserves other backends.
+                dcp_gather_local_buffer = getattr(
+                    self.impl, "dcp_q_gather_local_buffer", None
+                )
+                dcp_gather_buffer = getattr(self.impl, "dcp_q_gather_buffer", None)
+                dcp_gather_rank_buffer = getattr(
+                    self.impl, "dcp_q_gather_rank_buffer", None
+                )
+                gathered_mqa_q = _dcp_all_gather_heads_into_buffer(
+                    mqa_q,
+                    dcp_gather_local_buffer,
+                    dcp_gather_buffer,
+                    dcp_gather_rank_buffer,
+                )
+                if gathered_mqa_q is None:
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                else:
+                    mqa_q = gathered_mqa_q
             elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
@@ -791,12 +1007,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         is_lse_base_on_e=True,
                     )
                 else:
-                    attn_out = cp_lse_ag_out_rs(
+                    dcp_group = get_dcp_group()
+                    buffered_attn_out = _dcp_lse_ag_out_rs_into_buffer(
                         attn_out,
                         lse,
-                        get_dcp_group(),
+                        dcp_group,
+                        getattr(self.impl, "dcp_lse_local_buffer", None),
+                        getattr(self.impl, "dcp_lse_gather_buffer", None),
+                        getattr(self.impl, "dcp_lse_output_buffer", None),
+                        getattr(self.impl, "dcp_attn_rs_input_buffer", None),
+                        getattr(self.impl, "dcp_attn_rs_rank_output_buffer", None),
+                        getattr(self.impl, "dcp_attn_rs_output_buffer", None),
                         is_lse_base_on_e=True,
                     )
+                    if buffered_attn_out is None:
+                        attn_out = cp_lse_ag_out_rs(
+                            attn_out,
+                            lse,
+                            dcp_group,
+                            is_lse_base_on_e=True,
+                        )
+                    else:
+                        attn_out = buffered_attn_out
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)

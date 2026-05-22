@@ -264,9 +264,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return tuple(tasks)
 
     def _preinstall_b12x_joint_attention_arenas(self) -> None:
-        kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
-        moe_backend = str(getattr(kernel_cfg, "moe_backend", "") or "").lower()
-        if kernel_cfg is None or moe_backend != "b12x":
+        from vllm.model_executor.layers.b12x_contract import (
+            b12x_moe_backend_selected_for_config,
+        )
+
+        if not b12x_moe_backend_selected_for_config(self.vllm_config):
             return
 
         installed = 0
@@ -308,9 +310,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _preload_b12x_w4a16_packed_weights(self) -> None:
         if os.getenv("VLLM_B12X_W4A16_PACKED_WEIGHT_PRELOAD", "1") == "0":
             return
-        kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
-        moe_backend = str(getattr(kernel_cfg, "moe_backend", "") or "").lower()
-        if kernel_cfg is None or moe_backend != "b12x":
+        from vllm.model_executor.layers.b12x_contract import (
+            b12x_moe_backend_selected_for_config,
+        )
+
+        if not b12x_moe_backend_selected_for_config(self.vllm_config):
             return
         if os.getenv("B12X_MOE_FORCE_A16", "0") in ("", "0", "false", "False"):
             return
@@ -322,7 +326,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             return
 
+        from b12x.integration.tp_moe import preload_w4a16_packed_weights
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        def _b12x_w4a16_activation_name(activation: object) -> str:
+            if isinstance(activation, MoEActivation):
+                if activation == MoEActivation.RELU2:
+                    return "relu2"
+                return "silu"
+            activation_name = str(getattr(activation, "value", activation))
+            if activation_name == "relu2":
+                return "relu2"
+            return "silu"
+
+        def _release_tensor_storage(tensor: torch.Tensor | None) -> int:
+            if tensor is None or not isinstance(tensor, torch.Tensor):
+                return 0
+            if tensor.numel() == 0:
+                return 0
+            nbytes = tensor.numel() * tensor.element_size()
+            tensor.data = torch.empty((0,), dtype=tensor.dtype, device=tensor.device)
+            return nbytes
 
         models: list[tuple[str, nn.Module | None]] = [("model", self.model)]
         speculator = getattr(self, "speculator", None)
@@ -331,6 +356,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         seen_roots: set[int] = set()
         seen_layers: set[int] = set()
         preloaded = 0
+        released_nbytes = 0
         start = time.perf_counter()
         for root_name, root in models:
             if root is None or id(root) in seen_roots:
@@ -340,28 +366,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if not isinstance(module, FusedMoE) or id(module) in seen_layers:
                     continue
                 seen_layers.add(id(module))
-                hidden_states = torch.zeros(
-                    1,
-                    int(module.hidden_size),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                router_logits = torch.zeros(
-                    1,
-                    int(module.global_num_experts),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                with (
-                    torch.inference_mode(),
-                    set_forward_context(
-                        attn_metadata=None,
-                        vllm_config=self.vllm_config,
-                        num_tokens=1,
-                    ),
-                ):
-                    module(hidden_states, router_logits)
-                del hidden_states, router_logits
+                quant_method = getattr(module, "quant_method", None)
+                moe_kernel = getattr(quant_method, "moe_kernel", None)
+                impl = getattr(moe_kernel, "impl", None)
+                experts = getattr(impl, "fused_experts", None)
+                if experts is None or experts.__class__.__name__ != "B12xExperts":
+                    continue
+                quant_mode = experts._select_quant_mode()
+                if quant_mode == "nvfp4":
+                    continue
+                with torch.inference_mode():
+                    preload_w4a16_packed_weights(
+                        module.w13_weight,
+                        experts.w1_scale,
+                        experts.g1_alphas,
+                        experts.a1_gscale,
+                        module.w2_weight,
+                        experts.w2_scale,
+                        experts.g2_alphas,
+                        experts.a2_gscale,
+                        activation=_b12x_w4a16_activation_name(module.activation),
+                        params_dtype=self.dtype,
+                        quant_mode=quant_mode,
+                    )
+                    released_nbytes += _release_tensor_storage(experts.w1_scale)
+                    released_nbytes += _release_tensor_storage(experts.w2_scale)
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
                 preloaded += 1
@@ -373,9 +402,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if preloaded:
             logger.info(
-                "Preloaded b12x W4A16 packed weights for %d MoE layers in %.1fs.",
+                "Preloaded b12x W4A16 packed weights for %d MoE layers in %.1fs "
+                "(released %.2f GiB of source block scales).",
                 preloaded,
                 time.perf_counter() - start,
+                released_nbytes / (1024**3),
             )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
@@ -405,8 +436,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
             if not load_dummy_weights:
-                self._preinstall_b12x_joint_attention_arenas()
                 self._preload_b12x_w4a16_packed_weights()
+                self._preinstall_b12x_joint_attention_arenas()
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

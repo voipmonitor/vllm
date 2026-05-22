@@ -4349,6 +4349,146 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+
+        def _debug_full_cg_before_forward() -> None:
+            if (
+                cudagraph_mode != CUDAGraphMode.FULL
+                or os.getenv("VLLM_DEBUG_FULL_CG_BEFORE", "0") != "1"
+            ):
+                return
+
+            debug_count = getattr(self, "_debug_full_cg_before_count", 0)
+            debug_limit = int(os.getenv("VLLM_DEBUG_FULL_CG_BEFORE_LIMIT", "16"))
+            if debug_count >= debug_limit:
+                return
+
+            try:
+                meta_name = None
+                meta = None
+                if isinstance(attn_metadata, dict):
+                    for name, value in attn_metadata.items():
+                        if hasattr(value, "page_table_1"):
+                            meta_name = name
+                            meta = value
+                            break
+                elif hasattr(attn_metadata, "page_table_1"):
+                    meta_name = "<direct>"
+                    meta = attn_metadata
+
+                def _tensor_preview(tensor: torch.Tensor, limit: int = 16) -> list:
+                    return tensor.detach().flatten()[:limit].cpu().tolist()
+
+                def _shape(tensor: torch.Tensor | None) -> list[int] | None:
+                    return list(tensor.shape) if isinstance(tensor, torch.Tensor) else None
+
+                spec_tokens = {
+                    str(req_id): list(tokens)
+                    for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+                }
+                slot_mapping_preview = None
+                slot_mapping_shape = _shape(slot_mappings)
+                if isinstance(slot_mappings, torch.Tensor):
+                    slot_mapping_preview = _tensor_preview(
+                        slot_mappings[:num_tokens_padded]
+                    )
+                elif isinstance(slot_mappings, dict):
+                    for layer_name, layer_slots in slot_mappings.items():
+                        if isinstance(layer_slots, torch.Tensor):
+                            slot_mapping_shape = list(layer_slots.shape)
+                            slot_mapping_preview = {
+                                "layer": str(layer_name),
+                                "values": _tensor_preview(
+                                    layer_slots[:num_tokens_padded]
+                                ),
+                            }
+                            break
+                payload = {
+                    "count": debug_count,
+                    "cudagraph_mode": str(cudagraph_mode),
+                    "batch_desc": str(batch_desc),
+                    "num_tokens_unpadded": int(num_tokens_unpadded),
+                    "num_tokens_padded": int(num_tokens_padded),
+                    "num_reqs": int(num_reqs),
+                    "num_reqs_padded": int(num_reqs_padded),
+                    "max_scheduled": int(max_num_scheduled_tokens),
+                    "num_scheduled_tokens_np": num_scheduled_tokens_np.tolist(),
+                    "scheduled_spec_decode_tokens": spec_tokens,
+                    "query_start_loc_cpu": self.query_start_loc.cpu[
+                        : num_reqs_padded + 1
+                    ].tolist(),
+                    "seq_lens_cpu": self.optimistic_seq_lens_cpu[
+                        :num_reqs_padded
+                    ].tolist(),
+                    "num_computed_tokens_cpu": self.input_batch.num_computed_tokens_cpu[
+                        :num_reqs_padded
+                    ].tolist(),
+                    "input_ids_shape": _shape(input_ids),
+                    "positions_shape": _shape(positions),
+                    "input_ids": (
+                        _tensor_preview(input_ids[:num_tokens_padded])
+                        if isinstance(input_ids, torch.Tensor)
+                        else None
+                    ),
+                    "positions": _tensor_preview(positions[..., :num_tokens_padded]),
+                    "slot_mappings_shape": slot_mapping_shape,
+                    "slot_mappings": slot_mapping_preview,
+                }
+
+                if meta is not None:
+                    rows = min(4, int(meta.page_table_1.shape[0]))
+                    cols = min(16, int(meta.page_table_1.shape[1]))
+                    payload.update(
+                        {
+                            "meta": meta_name,
+                            "meta_num_reqs": int(meta.num_reqs),
+                            "meta_num_actual_tokens": int(meta.num_actual_tokens),
+                            "meta_max_query_len": int(meta.max_query_len),
+                            "meta_max_seq_len": int(meta.max_seq_len),
+                            "meta_req_id_per_token": _tensor_preview(
+                                meta.req_id_per_token[:rows], rows
+                            ),
+                            "meta_cache_req": _tensor_preview(
+                                meta.cache_seq_lens_per_req[:rows], rows
+                            ),
+                            "meta_cache_tok": _tensor_preview(
+                                meta.cache_seq_lens_per_token[:rows], rows
+                            ),
+                            "meta_nsa": _tensor_preview(
+                                meta.nsa_cache_seqlens[:rows], rows
+                            ),
+                            "meta_valid": (
+                                (meta.page_table_1[:rows] >= 0)
+                                .sum(dim=1)
+                                .detach()
+                                .cpu()
+                                .tolist()
+                            ),
+                            "meta_page": meta.page_table_1[:rows, :cols]
+                            .detach()
+                            .cpu()
+                            .tolist(),
+                        }
+                    )
+                else:
+                    payload.update(
+                        {
+                            "error": "no page_table_1 metadata found",
+                            "attn_metadata_type": str(type(attn_metadata)),
+                        }
+                    )
+
+                debug_file = os.getenv(
+                    "VLLM_DEBUG_FULL_CG_BEFORE_FILE",
+                    "/tmp/vllm_full_cg_before.jsonl",
+                )
+                with open(debug_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, sort_keys=True) + "\n")
+                logger.warning("FULL_CG_BEFORE_DEBUG %s", payload)
+            except Exception:
+                logger.exception("FULL_CG_BEFORE_DEBUG failed")
+            finally:
+                setattr(self, "_debug_full_cg_before_count", debug_count + 1)
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -4367,6 +4507,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            _debug_full_cg_before_forward()
             if (
                 cudagraph_mode == CUDAGraphMode.FULL
                 and os.getenv("VLLM_DEBUG_SYNC_BEFORE_FULL_CG", "0") == "1"
@@ -5364,9 +5505,11 @@ class GPUModelRunner(
             setattr(self, config_name, new_config)
 
     def _preinstall_b12x_joint_attention_arenas(self) -> None:
-        kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
-        moe_backend = str(getattr(kernel_cfg, "moe_backend", "") or "").lower()
-        if kernel_cfg is None or moe_backend != "b12x":
+        from vllm.model_executor.layers.b12x_contract import (
+            b12x_moe_backend_selected_for_config,
+        )
+
+        if not b12x_moe_backend_selected_for_config(self.vllm_config):
             return
 
         installed = 0
@@ -5408,9 +5551,11 @@ class GPUModelRunner(
     def _preload_b12x_w4a16_packed_weights(self) -> None:
         if os.getenv("VLLM_B12X_W4A16_PACKED_WEIGHT_PRELOAD", "1") == "0":
             return
-        kernel_cfg = getattr(self.vllm_config, "kernel_config", None)
-        moe_backend = str(getattr(kernel_cfg, "moe_backend", "") or "").lower()
-        if kernel_cfg is None or moe_backend != "b12x":
+        from vllm.model_executor.layers.b12x_contract import (
+            b12x_moe_backend_selected_for_config,
+        )
+
+        if not b12x_moe_backend_selected_for_config(self.vllm_config):
             return
         if os.getenv("B12X_MOE_FORCE_A16", "0") in ("", "0", "false", "False"):
             return
@@ -5422,7 +5567,28 @@ class GPUModelRunner(
         ):
             return
 
+        from b12x.integration.tp_moe import preload_w4a16_packed_weights
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        def _b12x_w4a16_activation_name(activation: object) -> str:
+            if isinstance(activation, MoEActivation):
+                if activation == MoEActivation.RELU2:
+                    return "relu2"
+                return "silu"
+            activation_name = str(getattr(activation, "value", activation))
+            if activation_name == "relu2":
+                return "relu2"
+            return "silu"
+
+        def _release_tensor_storage(tensor: torch.Tensor | None) -> int:
+            if tensor is None or not isinstance(tensor, torch.Tensor):
+                return 0
+            if tensor.numel() == 0:
+                return 0
+            nbytes = tensor.numel() * tensor.element_size()
+            tensor.data = torch.empty((0,), dtype=tensor.dtype, device=tensor.device)
+            return nbytes
 
         models: list[tuple[str, nn.Module | None]] = [("model", self.model)]
         drafter = getattr(self, "drafter", None)
@@ -5431,6 +5597,7 @@ class GPUModelRunner(
         seen_roots: set[int] = set()
         seen_layers: set[int] = set()
         preloaded = 0
+        released_nbytes = 0
         start = time.perf_counter()
         for root_name, root in models:
             if root is None or id(root) in seen_roots:
@@ -5440,30 +5607,31 @@ class GPUModelRunner(
                 if not isinstance(module, FusedMoE) or id(module) in seen_layers:
                     continue
                 seen_layers.add(id(module))
-                hidden_size = int(module.hidden_size)
-                num_experts = int(module.global_num_experts)
-                hidden_states = torch.zeros(
-                    1,
-                    hidden_size,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                router_logits = torch.zeros(
-                    1,
-                    num_experts,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                with (
-                    torch.inference_mode(),
-                    set_forward_context(
-                        attn_metadata=None,
-                        vllm_config=self.vllm_config,
-                        num_tokens=1,
-                    ),
-                ):
-                    module(hidden_states, router_logits)
-                del hidden_states, router_logits
+                quant_method = getattr(module, "quant_method", None)
+                moe_kernel = getattr(quant_method, "moe_kernel", None)
+                impl = getattr(moe_kernel, "impl", None)
+                experts = getattr(impl, "fused_experts", None)
+                if experts is None or experts.__class__.__name__ != "B12xExperts":
+                    continue
+                quant_mode = experts._select_quant_mode()
+                if quant_mode == "nvfp4":
+                    continue
+                with torch.inference_mode():
+                    preload_w4a16_packed_weights(
+                        module.w13_weight,
+                        experts.w1_scale,
+                        experts.g1_alphas,
+                        experts.a1_gscale,
+                        module.w2_weight,
+                        experts.w2_scale,
+                        experts.g2_alphas,
+                        experts.a2_gscale,
+                        activation=_b12x_w4a16_activation_name(module.activation),
+                        params_dtype=self.dtype,
+                        quant_mode=quant_mode,
+                    )
+                    released_nbytes += _release_tensor_storage(experts.w1_scale)
+                    released_nbytes += _release_tensor_storage(experts.w2_scale)
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
                 preloaded += 1
@@ -5475,9 +5643,11 @@ class GPUModelRunner(
 
         if preloaded:
             logger.info(
-                "Preloaded b12x W4A16 packed weights for %d MoE layers in %.1fs.",
+                "Preloaded b12x W4A16 packed weights for %d MoE layers in %.1fs "
+                "(released %.2f GiB of source block scales).",
                 preloaded,
                 time.perf_counter() - start,
+                released_nbytes / (1024**3),
             )
 
     @instrument(span_name="Loading (GPU)")
@@ -7508,6 +7678,12 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
             )
+        if num_warmups:
+            # Warmup forwards can enqueue work on auxiliary streams (for example
+            # fused MoE or attention side streams). Full CUDA graph capture starts
+            # on the main stream, so wait for all warmup work before recording a
+            # graph that reuses static workspaces and IPC-registered AR buffers.
+            torch.accelerator.synchronize()
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -7546,8 +7722,20 @@ class GPUModelRunner(
                 ),
             )
 
+        log_capture_shapes = os.getenv("VLLM_CUDAGRAPH_CAPTURE_SHAPE_LOG", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        num_batch_descs = (
+            len(batch_descriptors)
+            if isinstance(batch_descriptors, list)
+            else None
+        )
+
         # We skip EPLB here since we don't want to record dummy metrics
-        for batch_desc in batch_descriptors:
+        for capture_idx, batch_desc in enumerate(batch_descriptors, start=1):
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
             # is above the threshold. Otherwise we just capture a non-ubatched
@@ -7575,6 +7763,17 @@ class GPUModelRunner(
                         profile_seq_lens,
                         batch_desc,
                     )
+            if log_capture_shapes:
+                logger.info(
+                    "Capturing CUDA graph descriptor %s/%s mode=%s desc=%s "
+                    "allow_microbatching=%s profile_seq_lens=%s",
+                    capture_idx,
+                    num_batch_descs or "?",
+                    cudagraph_runtime_mode.name,
+                    batch_desc,
+                    allow_microbatching,
+                    profile_seq_lens,
+                )
             self._warmup_and_capture(
                 batch_desc,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,

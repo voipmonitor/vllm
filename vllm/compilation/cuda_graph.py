@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -281,6 +282,9 @@ class CUDAGraphWrapper:
             ]
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
+            debug_dump_dir = os.environ.get("VLLM_CUDAGRAPH_DEBUG_DUMP_DIR")
+            if debug_dump_dir:
+                cudagraph.enable_debug_mode()
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -335,6 +339,25 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            if debug_dump_dir:
+                try:
+                    os.makedirs(debug_dump_dir, exist_ok=True)
+                    safe_descriptor = (
+                        str(entry.batch_descriptor)
+                        .replace(" ", "_")
+                        .replace("(", "_")
+                        .replace(")", "_")
+                        .replace(",", "")
+                        .replace("=", "-")
+                    )
+                    dump_path = os.path.join(
+                        debug_dump_dir,
+                        f"{self.runtime_mode.name}_{safe_descriptor}.dot",
+                    )
+                    cudagraph.debug_dump(dump_path)
+                    logger.warning("CUDAGRAPH_DEBUG_DUMP %s", dump_path)
+                except Exception:
+                    logger.exception("CUDAGRAPH_DEBUG_DUMP failed")
 
             compilation_counter.num_cudagraph_captured += 1
 
@@ -357,5 +380,23 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
+        if os.environ.get("VLLM_CUDAGRAPH_REPLAY_LOG", "0") == "1":
+            tensor_summaries = []
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    tensor_summaries.append(
+                        (
+                            tuple(arg.shape),
+                            str(arg.dtype),
+                            str(arg.device),
+                            hex(arg.data_ptr()),
+                        )
+                    )
+            logger.warning(
+                "CUDAGRAPH_REPLAY mode=%s descriptor=%s tensors=%s",
+                self.runtime_mode.name,
+                entry.batch_descriptor,
+                tensor_summaries,
+            )
         entry.cudagraph.replay()
         return entry.output

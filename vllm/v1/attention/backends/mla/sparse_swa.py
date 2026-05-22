@@ -461,6 +461,16 @@ def _compute_swa_indices_and_lens_kernel(
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
         tl.store(swa_lens_ptr + token_idx, 0)
+        # CUDA graph replay reuses the metadata buffers captured at warmup.
+        # Keep zero-length rows safe even if a downstream FlashMLA planner or
+        # kernel speculatively reads an index before observing the length.
+        for i in range(0, window_size, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + token_idx * swa_indices_stride + offset,
+                tl.zeros((TRITON_BLOCK_SIZE,), dtype=tl.int32),
+                mask=offset < window_size,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)

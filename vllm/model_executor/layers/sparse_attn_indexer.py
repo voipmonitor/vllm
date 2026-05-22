@@ -14,6 +14,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.b12x_contract import (
+    b12x_moe_backend_selected_for_config,
     b12x_sparse_indexer_active_for_config,
 )
 from vllm.platforms import current_platform
@@ -215,6 +216,59 @@ def _use_b12x_sparse_indexer() -> bool:
     )
 
 
+def _b12x_indexer_moe_backend_name(vllm_config: object | None) -> str:
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    return str(getattr(kernel_config, "moe_backend", "") or "").lower()
+
+
+def _get_shared_b12x_mla_indexer_arena(
+    *,
+    q_fp8: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    mode: str,
+    num_q_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    indexer_num_q_heads: int,
+    topk_tokens: int,
+    max_page_table_width: int,
+    decode_max_total_q: int,
+    caps_extend_max_total_q: int,
+    caps_extend_max_batch: int,
+    caps_extend_max_kv_rows: int,
+    extend_indexer_tile_logits_k_rows: int,
+):
+    vllm_config = _get_runtime_vllm_config()
+    try:
+        from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+            _get_b12x_covering_arena,
+        )
+    except (ImportError, AttributeError):
+        return None
+
+    return _get_b12x_covering_arena(
+        device_type=q_fp8.device.type,
+        device_index=q_fp8.device.index,
+        mode=mode,
+        dtype=torch.bfloat16,
+        kv_dtype=index_k_cache.dtype,
+        num_q_heads=num_q_heads,
+        head_size=head_dim,
+        kv_lora_rank=v_head_dim,
+        indexer_num_q_heads=indexer_num_q_heads,
+        topk=topk_tokens,
+        max_page_table_width=max_page_table_width,
+        decode_max_total_q=decode_max_total_q,
+        caps_extend_max_total_q=caps_extend_max_total_q,
+        caps_extend_max_batch=caps_extend_max_batch,
+        caps_extend_max_kv_rows=caps_extend_max_kv_rows,
+        reserve_extend_indexer_logits=False,
+        extend_indexer_tile_logits_k_rows=extend_indexer_tile_logits_k_rows,
+        use_joint_arena=b12x_moe_backend_selected_for_config(vllm_config),
+        moe_backend=_b12x_indexer_moe_backend_name(vllm_config),
+    )
+
+
 def _has_sgl_kernel_fast_topk() -> bool:
     if not _USE_SGL_KERNEL_FAST_TOPK:
         return False
@@ -326,6 +380,23 @@ def _get_b12x_indexer_workspace(
 
     arena = _B12X_INDEXER_ARENAS.get(key)
     if arena is None:
+        arena = _get_shared_b12x_mla_indexer_arena(
+            q_fp8=q_fp8,
+            index_k_cache=index_k_cache,
+            mode="decode",
+            num_q_heads=1,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            indexer_num_q_heads=indexer_num_q_heads,
+            topk_tokens=topk_tokens,
+            max_page_table_width=max_page_table_width,
+            decode_max_total_q=paged_max_q_rows,
+            caps_extend_max_total_q=1,
+            caps_extend_max_batch=1,
+            caps_extend_max_kv_rows=0,
+            extend_indexer_tile_logits_k_rows=0,
+        )
+    if arena is None:
         caps = B12XAttentionArenaCaps(
             device=q_fp8.device,
             dtype=torch.bfloat16,
@@ -344,7 +415,7 @@ def _get_b12x_indexer_workspace(
             page_size=page_size,
         )
         arena = B12XAttentionArena.allocate(caps)
-        _B12X_INDEXER_ARENAS[key] = arena
+    _B12X_INDEXER_ARENAS[key] = arena
 
     contract = B12XAttentionWorkspaceContract(
         mode="decode",

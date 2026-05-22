@@ -34,7 +34,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
 )
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    create_eagle_draft_vllm_config,
+    load_eagle_model,
+)
 
 logger = init_logger(__name__)
 
@@ -46,6 +49,7 @@ class EagleSpeculator:
 
         self.speculative_config = vllm_config.speculative_config
         assert self.speculative_config is not None
+        self.draft_vllm_config = create_eagle_draft_vllm_config(vllm_config)
         self.method = self.speculative_config.method
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config
@@ -130,7 +134,7 @@ class EagleSpeculator:
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = PrefillEagleCudaGraphManager(
-            self.vllm_config,
+            self.draft_vllm_config,
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
@@ -147,7 +151,7 @@ class EagleSpeculator:
 
         # Initialize cudagraph manager for draft decodes (draft positions > 0).
         self.decode_cudagraph_manager = DecodeEagleCudaGraphManager(
-            self.vllm_config,
+            self.draft_vllm_config,
             self.device,
             cudagraph_mode,
             decode_query_len=1,
@@ -182,7 +186,7 @@ class EagleSpeculator:
         self.kv_cache_config = kv_cache_config
         _, self.attn_groups, _, _ = init_attn_backend(
             kv_cache_config,
-            self.vllm_config,
+            self.draft_vllm_config,
             self.device,
             active_layer_names=self.draft_attn_layer_names,
         )
@@ -201,7 +205,7 @@ class EagleSpeculator:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
             attn_metadata,
-            self.vllm_config,
+            self.draft_vllm_config,
             num_tokens=num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             num_tokens_across_dp=num_tokens_across_dp,
