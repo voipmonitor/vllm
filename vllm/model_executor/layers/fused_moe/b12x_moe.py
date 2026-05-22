@@ -99,6 +99,20 @@ def _next_pow2_ge(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def _planned_w4a16_token_counts(workspace: object) -> frozenset[int]:
+    counts: set[int] = set()
+    direct_counts = getattr(workspace, "planned_token_counts", None)
+    if direct_counts:
+        counts.update(int(count) for count in direct_counts)
+    workspaces = getattr(workspace, "workspaces", None)
+    if isinstance(workspaces, dict):
+        for item in workspaces.values():
+            planned = getattr(item, "planned_token_counts", None)
+            if planned:
+                counts.update(int(count) for count in planned)
+    return frozenset(count for count in counts if count > 0)
+
+
 def _b12x_moe_fp4_pad_m(
     *,
     a: torch.Tensor,
@@ -135,6 +149,7 @@ def _b12x_moe_fp4_pad_m(
     from b12x.integration.tp_moe import b12x_moe_fp4
 
     m = a.shape[0]
+    planned_token_counts = _planned_w4a16_token_counts(kwargs.get("workspace"))
     if (
         _B12X_MOE_STATIC_CHUNK_TOKENS > 0
         and m > _B12X_MOE_STATIC_CHUNK_TOKENS
@@ -155,7 +170,15 @@ def _b12x_moe_fp4_pad_m(
             )
         return
 
-    if not _B12X_PAD_M_TO_POW2 or m <= 1 or m < _B12X_MOE_PAD_MIN_M:
+    if planned_token_counts:
+        candidates = [count for count in planned_token_counts if count >= m]
+        if not candidates:
+            raise RuntimeError(
+                "B12X W4A16 frozen MoE workspace does not contain a planned "
+                f"launch large enough for m={m}; planned={sorted(planned_token_counts)}"
+            )
+        m_padded = min(candidates)
+    elif not _B12X_PAD_M_TO_POW2 or m <= 1 or m < _B12X_MOE_PAD_MIN_M:
         b12x_moe_fp4(
             a=a,
             output=output,
@@ -164,8 +187,9 @@ def _b12x_moe_fp4_pad_m(
             **kwargs,
         )
         return
+    else:
+        m_padded = _next_pow2_ge(m)
 
-    m_padded = _next_pow2_ge(m)
     if m_padded == m:
         b12x_moe_fp4(
             a=a,

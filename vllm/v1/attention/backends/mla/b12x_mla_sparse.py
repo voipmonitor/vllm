@@ -961,6 +961,62 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             layer_idx = 0
         return f"ring{layer_idx % self.decode_workspace_ring}"
 
+    def _b12x_moe_core_token_counts(
+        self,
+        *,
+        extend_tokens: int,
+        decode_tokens: int,
+    ) -> tuple[int, ...]:
+        counts = {max(1, int(extend_tokens)), max(1, int(decode_tokens))}
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        max_batched_tokens = int(
+            getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+        )
+        if max_batched_tokens > 0:
+            counts.add(max_batched_tokens)
+            pow2 = 1
+            while pow2 <= max_batched_tokens:
+                counts.add(pow2)
+                pow2 <<= 1
+
+        compilation_config = getattr(self.vllm_config, "compilation_config", None)
+        capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+        if capture_sizes:
+            counts.update(
+                int(size)
+                for size in capture_sizes
+                if int(size) > 0
+                and (max_batched_tokens <= 0 or int(size) <= max_batched_tokens)
+            )
+
+        # Keep the frozen W4A16 MoE arena in sync with FlashInfer autotune dummy
+        # model runs. These runs execute the full model, so MoE must pre-plan
+        # every token count used by autotune while the pool is frozen.
+        kernel_config = getattr(self.vllm_config, "kernel_config", None)
+        if getattr(kernel_config, "enable_flashinfer_autotune", True) is not False:
+            raw_sizes = os.getenv("VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES")
+            if raw_sizes:
+                try:
+                    autotune_sizes = {
+                        int(size.strip())
+                        for size in raw_sizes.split(",")
+                        if size.strip()
+                    }
+                    if not autotune_sizes or any(size <= 0 for size in autotune_sizes):
+                        raise ValueError
+                except ValueError:
+                    autotune_sizes = {24, 56, 75, 80, 120, 248, 496, 640}
+            else:
+                autotune_sizes = {24, 56, 75, 80, 120, 248, 496, 640}
+            counts.update(
+                size
+                for size in autotune_sizes
+                if size > 0
+                and (max_batched_tokens <= 0 or size <= max_batched_tokens)
+            )
+
+        return tuple(sorted(counts))
+
     def _build_b12x_moe_arena_caps(self, device: torch.device, dtype: torch.dtype):
         if not self.use_joint_arena:
             return None
@@ -1014,6 +1070,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         decode_tokens = max(1, int(self.decode_max_total_q))
         extend_tokens = max(1, int(self.arena_extend_max_total_q))
         max_tokens = max(decode_tokens, extend_tokens)
+        core_token_counts = self._b12x_moe_core_token_counts(
+            extend_tokens=extend_tokens,
+            decode_tokens=decode_tokens,
+        )
         return B12XMoEArenaCaps(
             device=device,
             dtype=dtype,
@@ -1022,7 +1082,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             n=intermediate_size // tp_size,
             num_topk=int(num_topk),
             max_tokens=max_tokens,
-            core_token_counts=(extend_tokens, decode_tokens),
+            core_token_counts=core_token_counts,
             route_num_experts=int(weight_e),
             route_logits_dtype=dtype,
         )
