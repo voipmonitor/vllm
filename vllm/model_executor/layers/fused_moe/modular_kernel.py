@@ -347,13 +347,13 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
     @abstractmethod
     def finalize(
         self,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
         fused_expert_output: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: TopKWeightAndReduce,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """
         Perform any combine plus apply weights and perform a reduction on the
         fused experts output.
@@ -1044,7 +1044,8 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        final_output_shape: tuple[int, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Allocate temporary and output buffers for the fused experts op.
         Inputs:
@@ -1085,14 +1086,40 @@ class FusedMoEKernelModularImpl:
         # time we need cache3, we're done with cache1.
         # Reuse workspace13 for the output since there is only one chunk.
         max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+        workspace_requests: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_shape_size,), workspace_dtype),
             (workspace2_shape, workspace_dtype),
+        ]
+        if final_output_shape is not None:
+            workspace_requests.append((final_output_shape, out_dtype))
+
+        workspace_buffers = current_workspace_manager().get_simultaneous(
+            *workspace_requests
         )
+        common_workspace, workspace2 = workspace_buffers[:2]
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
         fused_out = _resize_cache(common_workspace, fused_out_shape)
+        final_output = workspace_buffers[2] if final_output_shape is not None else None
 
-        return workspace13, workspace2, fused_out
+        return workspace13, workspace2, fused_out, final_output
+
+    def _can_return_fused_out_directly(
+        self,
+        shared_experts: SharedExperts | None,
+    ) -> bool:
+        # With shared experts, the routed output is consumed immediately by
+        # shared+routed combine, so it is safe to return the fused output view
+        # directly. Without shared experts this would become the next layer's
+        # hidden_states and could be overwritten by the next workspace use.
+        if shared_experts is None or self.prepare_finalize.supports_async():
+            return False
+
+        weight_and_reduce_impl = self.fused_experts.finalize_weight_and_reduce_impl()
+        return (
+            self.prepare_finalize.__class__.__name__
+            == "MoEPrepareAndFinalizeNoDPEPModular"
+            and weight_and_reduce_impl.__class__.__name__ == "TopKWeightAndReduceNoOP"
+        )
 
     def _maybe_apply_shared_experts(
         self,
@@ -1210,7 +1237,8 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        final_output_shape: tuple[int, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
         )
@@ -1222,9 +1250,9 @@ class FusedMoEKernelModularImpl:
         # low-latency kernels are always batched and can never run into
         # the tensor.numel() == 0 case.
         if M_full == 0:
-            return torch.empty_like(a1q, dtype=in_dtype)
+            return torch.empty_like(a1q, dtype=in_dtype), None
 
-        workspace13, workspace2, fused_out = self._allocate_buffers(
+        workspace13, workspace2, fused_out, final_output = self._allocate_buffers(
             in_dtype,
             a1q.device,
             M_full,
@@ -1236,12 +1264,14 @@ class FusedMoEKernelModularImpl:
             local_num_experts,
             expert_tokens_meta,
             activation,
+            final_output_shape=final_output_shape,
         )
 
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
         # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
         # double-copy MoE write-back path).
+        output_alias = output_alias if output_alias is not None else final_output
         if current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1273,11 +1303,11 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        return fused_out
+        return fused_out, final_output
 
     def _finalize(
         self,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
         fused_out: torch.Tensor,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -1301,7 +1331,7 @@ class FusedMoEKernelModularImpl:
         if not self.prepare_finalize.supports_async():
             assert not dbo_enabled()
 
-            self.prepare_finalize.finalize(
+            final_output = self.prepare_finalize.finalize(
                 output,
                 fused_out,
                 topk_weights,
@@ -1309,7 +1339,10 @@ class FusedMoEKernelModularImpl:
                 apply_router_weight_on_input,
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
+            if final_output is not None:
+                return final_output
         else:
+            assert output is not None
             finalize_ret = self.prepare_finalize.finalize_async(
                 output,
                 fused_out,
@@ -1341,6 +1374,7 @@ class FusedMoEKernelModularImpl:
 
             receiver()
 
+        assert output is not None
         return output
 
     def apply(
@@ -1389,8 +1423,21 @@ class FusedMoEKernelModularImpl:
             assert shared_experts is None
             assert not disable_inplace()
             output = hidden_states
+            final_output_shape = None
+        elif shared_experts is not None and self._can_return_fused_out_directly(
+            shared_experts
+        ):
+            output = None
+            final_output_shape = None
+        elif shared_experts is not None:
+            # Routed output is consumed immediately by shared+routed combine in
+            # MoERunner.forward, so keep it in the reusable workspace instead
+            # of requiring a fresh hot-path allocation for every shared MoE.
+            output = None
+            final_output_shape = tuple(hidden_states.shape)
         else:
             output = torch.empty_like(hidden_states)
+            final_output_shape = None
 
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:
@@ -1405,7 +1452,7 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
         )
 
-        fused_out = self._fused_experts(
+        fused_out, workspace_output = self._fused_experts(
             in_dtype=hidden_states.dtype,
             a1q=a1q,
             a1q_scale=a1q_scale,
@@ -1420,7 +1467,10 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
+            final_output_shape=final_output_shape,
         )
+        if output is None and workspace_output is not None:
+            output = workspace_output
 
         return self._finalize(
             output,

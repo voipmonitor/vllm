@@ -177,38 +177,51 @@ def _b12x_moe_fp4_pad_m(
         return
 
     pad_n = m_padded - m
-    # F.pad pads along the LAST dim by default; we want to pad the row
-    # (zeroth) dim. For 2D `(m, dim)` tensors `pad=(0,0,0,pad_n)` means:
-    # last-dim left=0, last-dim right=0, second-last-dim left=0,
-    # second-last-dim right=pad_n. (PyTorch pad reads pairs in reverse.)
-    a_p = torch.nn.functional.pad(a, (0, 0, 0, pad_n))
+    quant_mode = kwargs.get("quant_mode")
+    is_w4a16 = _b12x_quant_mode_uses_w4a16(quant_mode)
+    a_for_call = a
+    if not is_w4a16:
+        # F.pad pads along the LAST dim by default; we want to pad the row
+        # (zeroth) dim. For 2D `(m, dim)` tensors `pad=(0,0,0,pad_n)` means:
+        # last-dim left=0, last-dim right=0, second-last-dim left=0,
+        # second-last-dim right=pad_n. (PyTorch pad reads pairs in reverse.)
+        a_for_call = torch.nn.functional.pad(a, (0, 0, 0, pad_n))
     topk_weights_p = torch.nn.functional.pad(
         topk_weights, (0, 0, 0, pad_n)
     )
-    # Padded `topk_ids` must be valid expert IDs even if their weights
-    # are zero, since b12x dispatches before applying weights. 0 is
-    # always a valid expert index.
+    # W4A16 can run a padded launch bucket against the original input tensor.
+    # Mark padded routes invalid so b12x route packing ignores them and the
+    # kernel never dereferences non-existent rows from `a`.
+    topk_pad_value = -1 if is_w4a16 else 0
     topk_ids_p = torch.nn.functional.pad(
-        topk_ids, (0, 0, 0, pad_n), value=0
+        topk_ids, (0, 0, 0, pad_n), value=topk_pad_value
     )
-    output_p = torch.empty(
-        (m_padded,) + tuple(output.shape[1:]),
-        dtype=output.dtype,
-        device=output.device,
-    )
+    output_p = None
+    if not is_w4a16:
+        output_p = torch.empty(
+            (m_padded,) + tuple(output.shape[1:]),
+            dtype=output.dtype,
+            device=output.device,
+        )
+
+    call_kwargs = dict(kwargs)
+    if is_w4a16:
+        call_kwargs["launch_rows"] = m_padded
 
     b12x_moe_fp4(
-        a=a_p,
-        output=output_p,
+        a=a_for_call,
+        output=output if output_p is None else output_p,
+        output_rows=m if output_p is None else None,
         topk_weights=topk_weights_p,
         topk_ids=topk_ids_p,
-        **kwargs,
+        **call_kwargs,
     )
 
-    # Real rows only — padded rows have zero weights so their `output_p`
-    # rows are zero, but copying them back into `output` would still cost
-    # a write. Slice + copy_ is cheaper.
-    output.copy_(output_p[:m])
+    if output_p is not None:
+        # Real rows only — padded rows have zero weights so their `output_p`
+        # rows are zero, but copying them back into `output` would still cost
+        # a write. Slice + copy_ is cheaper.
+        output.copy_(output_p[:m])
 
 
 def _get_b12x_workspace_pool(device: torch.device):

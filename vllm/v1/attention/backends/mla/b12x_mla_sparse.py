@@ -32,6 +32,7 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.b12x_contract import (
     B12X_KV_CACHE_DTYPES,
+    b12x_moe_backend_selected_for_config,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -383,6 +384,7 @@ def _get_b12x_covering_arena(
     kv_lora_rank: int,
     indexer_num_q_heads: int,
     topk: int,
+    max_page_table_width: int,
     decode_max_total_q: int,
     caps_extend_max_total_q: int,
     caps_extend_max_batch: int,
@@ -415,6 +417,10 @@ def _get_b12x_covering_arena(
             key_use_joint_arena,
             key_moe_backend,
         ) = key
+        arena_caps = getattr(arena, "caps", None)
+        key_max_page_table_width = int(
+            getattr(arena_caps, "max_page_table_width", key_topk)
+        )
         if (
             key_device_type != device_type
             or key_device_index != device_index
@@ -425,6 +431,7 @@ def _get_b12x_covering_arena(
             or key_kv_lora_rank != kv_lora_rank
             or key_indexer_num_q_heads < indexer_num_q_heads
             or key_topk != topk
+            or key_max_page_table_width < max_page_table_width
             or key_decode_max_total_q < decode_max_total_q
             or key_caps_extend_max_total_q < caps_extend_max_total_q
             or key_caps_extend_max_batch < caps_extend_max_batch
@@ -858,9 +865,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.arena_extend_max_kv_rows = _env_int(
             "VLLM_B12X_MLA_ARENA_EXTEND_MAX_KV_ROWS", self.max_model_len
         )
-        moe_backend = self._moe_backend_name(vllm_config)
         self.use_arena = True
-        self.use_joint_arena = moe_backend == "b12x"
+        self.use_joint_arena = self._b12x_moe_backend_selected(vllm_config)
         self.decode_topk_is_physical = (
             os.getenv("VLLM_B12X_MLA_RAW_DECODE_TOPK", "0") != "0"
             or os.getenv("VLLM_B12X_MLA_DECODE_TOPK_PHYSICAL", "0") != "0"
@@ -936,15 +942,70 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             os.getenv("VLLM_B12X_MLA_EXTEND_CLAMP_NSA_TO_CACHE", "0") != "0"
         )
 
-        (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
-            ((max_tokens, num_heads, head_size), torch.bfloat16),
-        )
+        self.dcp_q_gather_local_buffer: torch.Tensor | None = None
+        self.dcp_q_gather_buffer: torch.Tensor | None = None
+        self.dcp_q_gather_rank_buffer: torch.Tensor | None = None
+        self.dcp_attn_rs_input_buffer: torch.Tensor | None = None
+        self.dcp_attn_rs_rank_output_buffer: torch.Tensor | None = None
+        self.dcp_attn_rs_output_buffer: torch.Tensor | None = None
+        self.dcp_lse_local_buffer: torch.Tensor | None = None
+        self.dcp_lse_gather_buffer: torch.Tensor | None = None
+        self.dcp_lse_output_buffer: torch.Tensor | None = None
+        if self.dcp_world_size > 1:
+            (
+                self.q_concat_buffer,
+                self.dcp_q_gather_local_buffer,
+                self.dcp_q_gather_buffer,
+                self.dcp_q_gather_rank_buffer,
+                self.dcp_attn_rs_input_buffer,
+                self.dcp_attn_rs_rank_output_buffer,
+                self.dcp_attn_rs_output_buffer,
+                self.dcp_lse_local_buffer,
+                self.dcp_lse_gather_buffer,
+                self.dcp_lse_output_buffer,
+            ) = current_workspace_manager().get_simultaneous(
+                ((max_tokens, num_heads, head_size), torch.bfloat16),
+                ((max_tokens, num_heads, head_size), torch.bfloat16),
+                (
+                    (max_tokens, num_heads * self.dcp_world_size, head_size),
+                    torch.bfloat16,
+                ),
+                (
+                    (max_tokens * self.dcp_world_size, num_heads, head_size),
+                    torch.bfloat16,
+                ),
+                (
+                    (max_tokens * self.dcp_world_size, num_heads, self.kv_lora_rank),
+                    torch.bfloat16,
+                ),
+                ((max_tokens, num_heads, self.kv_lora_rank), torch.bfloat16),
+                ((max_tokens, num_heads, self.kv_lora_rank), torch.bfloat16),
+                ((max_tokens, num_heads * self.dcp_world_size), torch.float32),
+                (
+                    (max_tokens * self.dcp_world_size, num_heads * self.dcp_world_size),
+                    torch.float32,
+                ),
+                ((max_tokens, num_heads * self.dcp_world_size), torch.float32),
+            )
+        else:
+            (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
+                ((max_tokens, num_heads, head_size), torch.bfloat16),
+            )
         self._b12x_joint_arena_preinstalled = False
 
     @staticmethod
     def _moe_backend_name(vllm_config: VllmConfig) -> str:
         kernel_config = getattr(vllm_config, "kernel_config", None)
         return str(getattr(kernel_config, "moe_backend", "") or "").lower()
+
+    @staticmethod
+    def _b12x_moe_backend_selected(vllm_config: VllmConfig) -> bool:
+        return b12x_moe_backend_selected_for_config(vllm_config)
+
+    def _decode_max_page_table_width(self, topk: int) -> int:
+        page_size = 64
+        model_pages = (int(self.max_model_len) + page_size - 1) // page_size
+        return max(1, int(topk), model_pages)
 
     def _decode_workspace_layer_key(self, layer_key: str | None) -> str | None:
         if self.decode_workspace_per_layer:
@@ -964,7 +1025,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     def _build_b12x_moe_arena_caps(self, device: torch.device, dtype: torch.dtype):
         if not self.use_joint_arena:
             return None
-        if self._moe_backend_name(self.vllm_config) != "b12x":
+        if not self._b12x_moe_backend_selected(self.vllm_config):
             return None
 
         try:
@@ -1113,7 +1174,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         if (
             not self.use_arena
             or not self.use_joint_arena
-            or self._moe_backend_name(self.vllm_config) != "b12x"
+            or not self._b12x_moe_backend_selected(self.vllm_config)
             or not current_platform.is_cuda()
         ):
             return
@@ -1135,6 +1196,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         )
         num_q_heads = int(self.num_heads) * dcp_size
         topk = int(self.topk_indices_buffer.shape[1])
+        max_page_table_width = self._decode_max_page_table_width(topk)
         max_chunks_per_row = int(getattr(self, "extend_max_chunks_per_row", 64))
         attention_caps = self._build_b12x_attention_arena_caps(
             device=device,
@@ -1142,7 +1204,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             kv_dtype=torch.uint8,
             num_q_heads=num_q_heads,
             topk=topk,
-            max_page_table_width=topk,
+            max_page_table_width=max_page_table_width,
             max_chunks_per_row=max_chunks_per_row,
             caps_extend_max_total_q=self.arena_extend_max_total_q,
             caps_extend_max_batch=self.arena_extend_max_batch,
@@ -1214,7 +1276,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.decode_max_total_q,
             self.decode_max_total_q,
             0,
-            topk,
+            max_page_table_width,
             64,
             self.use_arena,
             self.arena_max_running_requests,
@@ -1235,7 +1297,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 max_kv_rows=0,
                 v_head_dim=self.kv_lora_rank,
                 indexer_num_q_heads=self.indexer_num_q_heads,
-                max_page_table_width=topk,
+                max_page_table_width=max_page_table_width,
             )
             workspace = arena.make_workspace(
                 contract, use_cuda_graph=self.decode_use_cuda_graph
@@ -1353,6 +1415,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             else self.arena_extend_max_batch
         )
         max_page_table_width = max(1, int(page_table_width or topk))
+        if mode == "decode":
+            max_page_table_width = max(
+                max_page_table_width, self._decode_max_page_table_width(topk)
+            )
         workspace_layer_key = (
             self._decode_workspace_layer_key(layer_key)
             if mode == "decode"
@@ -1458,6 +1524,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_lora_rank=self.kv_lora_rank,
                     indexer_num_q_heads=self.indexer_num_q_heads,
                     topk=topk,
+                    max_page_table_width=max_page_table_width,
                     decode_max_total_q=self.decode_max_total_q,
                     caps_extend_max_total_q=caps_extend_max_total_q,
                     caps_extend_max_batch=caps_extend_max_batch,
@@ -1650,9 +1717,33 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
             cache_seqlens = (
                 attn_metadata.cache_seq_lens_per_req
-                if attn_metadata.max_query_len <= 1
+                if (
+                    attn_metadata.max_query_len <= 1
+                    and attn_metadata.cache_seq_lens_per_req.shape[0]
+                    == page_table_1.shape[0]
+                )
                 else attn_metadata.cache_seq_lens_per_token
             )
+            decode_rows = page_table_1.shape[0]
+            cache_seqlens = cache_seqlens[:decode_rows]
+            if cache_seqlens.shape[0] != decode_rows:
+                raise RuntimeError(
+                    "B12X sparse MLA decode metadata row mismatch: "
+                    f"cache_seqlens={cache_seqlens.shape[0]} rows={decode_rows}"
+                )
+            if nsa_cache_seqlens.shape[0] != decode_rows:
+                nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[:decode_rows]
+                if nsa_cache_seqlens.shape[0] != decode_rows:
+                    raise RuntimeError(
+                        "B12X sparse MLA decode metadata row mismatch: "
+                        f"nsa_cache_seqlens={nsa_cache_seqlens.shape[0]} "
+                        f"rows={decode_rows}"
+                    )
+                torch.clamp(
+                    cache_seqlens,
+                    max=topk_indices.shape[1],
+                    out=nsa_cache_seqlens,
+                )
             if (
                 self.debug_b12x_mla
                 and attn_metadata.max_query_len > 1
@@ -1696,9 +1787,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 # slots may still map to physical cache rows. B12X consumes
                 # nsa_cache_seqlens as the number of selected rows to attend, so
                 # clamp it to the effective per-token KV length here.
-                nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[
-                    : cache_seqlens.shape[0]
-                ]
                 if compacted_page_table:
                     torch.minimum(
                         nsa_cache_seqlens,
@@ -1726,7 +1814,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 max_seq_len_k=attn_metadata.max_seq_len,
             )
             if self.need_to_return_lse_for_decode:
-                return _sparse_mla_decode_forward_with_lse_vllm_metadata(
+                out, lse = _sparse_mla_decode_forward_with_lse_vllm_metadata(
                     q_all=q_all,
                     kv_cache=kv_cache,
                     metadata=metadata,
@@ -1734,6 +1822,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
                 )
+                return out, lse
             out = _sparse_mla_decode_forward_vllm_metadata(
                 q_all=q_all,
                 kv_cache=kv_cache,
