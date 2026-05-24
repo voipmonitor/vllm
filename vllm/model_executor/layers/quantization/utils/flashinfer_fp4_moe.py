@@ -48,16 +48,33 @@ def reorder_w1w3_to_w3w1(
     weight: torch.Tensor, scale: torch.Tensor, dim: int = -2
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Re-order the concatenated `[w1, w3]` tensors to `[w3, w1]`"""
-    size = weight.size(dim)
-    assert size % 2 == 0, f"Expected even size in dim {dim}, got {size}"
-    half = size // 2
+    weight_dim = dim % weight.dim()
+    size = weight.size(weight_dim)
+    assert size % 2 == 0, f"Expected even size in dim {weight_dim}, got {size}"
 
-    w1, w3 = weight.split(half, dim=dim)
-    s1, s3 = scale.split(half, dim=dim)
+    def swap_halves_low_peak(tensor: torch.Tensor, local_dim: int) -> torch.Tensor:
+        """Swap concat halves using one half-sized temporary buffer."""
+        local_size = tensor.size(local_dim)
+        assert local_size % 2 == 0, (
+            f"Expected even size in dim {local_dim}, got {local_size}"
+        )
+        local_half = local_size // 2
+
+        if not tensor.is_contiguous():
+            first, second = tensor.split(local_half, dim=local_dim)
+            return torch.cat([second, first], dim=local_dim).contiguous()
+
+        with torch.no_grad():
+            first = tensor.narrow(local_dim, 0, local_half).clone()
+            tensor.narrow(local_dim, 0, local_half).copy_(
+                tensor.narrow(local_dim, local_half, local_half)
+            )
+            tensor.narrow(local_dim, local_half, local_half).copy_(first)
+        return tensor
 
     return (
-        torch.cat([w3, w1], dim=dim).contiguous(),
-        torch.cat([s3, s1], dim=dim).contiguous(),
+        swap_halves_low_peak(weight, weight_dim),
+        swap_halves_low_peak(scale, dim % scale.dim()),
     )
 
 
