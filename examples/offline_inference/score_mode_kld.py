@@ -489,6 +489,12 @@ def main():
         help="JSON dict passed as vLLM hf_overrides",
     )
     parser.add_argument(
+        "--llm-extra-json",
+        type=str,
+        default=None,
+        help="JSON dict merged into vLLM LLM kwargs for runtime-specific options",
+    )
+    parser.add_argument(
         "--enforce-eager",
         action="store_true",
         help="Pass enforce_eager=True to vLLM LLM",
@@ -567,6 +573,8 @@ def main():
         hf_overrides["index_topk"] = 0
     if hf_overrides:
         llm_kwargs["hf_overrides"] = hf_overrides
+    if args.llm_extra_json:
+        llm_kwargs.update(json.loads(args.llm_extra_json))
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
     if args.disable_custom_all_reduce:
