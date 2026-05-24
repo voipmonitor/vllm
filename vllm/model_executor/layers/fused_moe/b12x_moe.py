@@ -140,7 +140,7 @@ def _prepare_b12x_w4a16_modelopt_nvfp4_weights(
         a2_gscale,
         activation=activation,
         params_dtype=params_dtype,
-        source_format="modelopt_nvfp4",
+        source_format="modelopt_nvfp4_b12x",
         reuse_input_storage=False,
     )
 
@@ -664,7 +664,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             input_scales_static=True,
             activation=_b12x_activation_name(activation),
             quant_mode=quant_mode,
-            source_format="modelopt_nvfp4",
+            source_format="modelopt_nvfp4_b12x",
             prepared_w4a16=prepared_w4a16,
         )
 
