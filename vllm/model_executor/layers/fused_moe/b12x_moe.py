@@ -141,7 +141,7 @@ def _prepare_b12x_w4a16_modelopt_nvfp4_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format="modelopt_nvfp4",
-        reuse_input_storage=True,
+        reuse_input_storage=False,
     )
 
 
@@ -242,6 +242,59 @@ def _b12x_env_force_moe_a16() -> bool:
     return envs.VLLM_B12X_FORCE_MOE_A16
 
 
+def _iter_attn_metadata(attn_metadata: Any):
+    if isinstance(attn_metadata, dict):
+        yield from attn_metadata.values()
+        return
+    if isinstance(attn_metadata, list):
+        for item in attn_metadata:
+            yield from _iter_attn_metadata(item)
+        return
+    if attn_metadata is not None:
+        yield attn_metadata
+
+
+def _metadata_int(metadata: Any, attr: str) -> int | None:
+    value = getattr(metadata, attr, None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _current_forward_is_decode_only() -> bool:
+    if not is_forward_context_available():
+        return False
+
+    saw_decode = False
+    for metadata in _iter_attn_metadata(get_forward_context().attn_metadata):
+        num_prefills = _metadata_int(metadata, "num_prefills")
+        num_decodes = _metadata_int(metadata, "num_decodes")
+        num_decode_tokens = _metadata_int(metadata, "num_decode_tokens")
+
+        if (
+            num_prefills is not None
+            or num_decodes is not None
+            or num_decode_tokens is not None
+        ):
+            if (num_prefills or 0) > 0:
+                return False
+            saw_decode = saw_decode or (num_decodes or 0) > 0
+            saw_decode = saw_decode or (num_decode_tokens or 0) > 0
+            continue
+
+        max_query_len = _metadata_int(metadata, "max_query_len")
+        if max_query_len is None:
+            continue
+        if max_query_len > 1:
+            return False
+        saw_decode = True
+
+    return saw_decode
+
+
 # ---------------------------------------------------------------------------
 # Expert implementation
 # ---------------------------------------------------------------------------
@@ -328,8 +381,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 activation=activation,
                 params_dtype=params_dtype,
             )
-            self._release_w4a16_modelopt_source_scales(layer)
-            _maybe_release_cuda_cache(layer.w13_weight.device)
+            # Forced A16 is decode-only; prompt/prefill passes still need the
+            # original NVFP4 block scales for the A4 path.
 
     # ------------------------------------------------------------------
     # Static capabilities
@@ -393,9 +446,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         """Return the explicit b12x quant_mode override for this layer.
 
         ``"nvfp4"`` is the normal A4 path.
-        Passing ``"w4a16"`` asks b12x to use its W4A16 path. Selected layers
-        repack the ModelOpt NVFP4 checkpoint tensors into b12x's W4A16 layout.
-        Passing ``"nvfp4"`` is used only for layer-gated cases that
+        Passing ``"w4a16"`` asks b12x to use its W4A16 path on decode-only
+        forwards. Prompt/prefill and mixed batches stay on NVFP4 so quality
+        tests and logit scoring use the checkpoint's native A4 numerics.
+        Passing ``"nvfp4"`` is also used for layer-gated cases that
         intentionally stay on NVFP4.
 
         W4A16 bypasses NVFP4 activation quant/dequant. The optional layer gate
@@ -426,13 +480,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if _b12x_env_force_moe_a16() and not self._warned_global_a16:
             self._warned_global_a16 = True
             logger.warning_once(
-                "VLLM_B12X_FORCE_MOE_A16=1 changes B12X MoE activation "
-                "numerics. "
-                "For GLM-5.1 NVFP4 quality checks, leave it unset or gate "
-                "A16 with VLLM_B12X_MOE_A16_MIN_LAYER."
+                "VLLM_B12X_FORCE_MOE_A16=1 uses B12X W4A16 MoE only for "
+                "decode-only forwards; prefill and mixed batches keep NVFP4 "
+                "activation numerics."
             )
 
-        if _b12x_env_force_moe_a16():
+        if _b12x_env_force_moe_a16() and _current_forward_is_decode_only():
             return "w4a16"
         return "nvfp4"
 
