@@ -1071,7 +1071,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         extend_tokens = max(1, int(self.arena_extend_max_total_q))
         max_tokens = max(decode_tokens, extend_tokens)
         if envs.VLLM_B12X_FORCE_MOE_A16:
-            quant_modes = ("w4a16",)
+            # Forced A16 is decode-only. Prefill still uses NVFP4, so the
+            # shared arena must cover both MoE quant modes for one server.
+            quant_modes = ("nvfp4", "w4a16")
         else:
             quant_modes = ("nvfp4",)
 
