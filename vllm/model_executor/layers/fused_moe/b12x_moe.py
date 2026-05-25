@@ -129,6 +129,10 @@ def _prepare_b12x_w4a16_modelopt_nvfp4_weights(
 ):
     from b12x.integration import prepare_b12x_w4a16_modelopt_nvfp4_weights
 
+    # vLLM's NVFP4 load path reuses FlashInfer preparation, which physically
+    # reorders gated GLM W13 from checkpoint [w1, w3] to [w3, w1]. Keep that
+    # tensor order explicit; source_format describes only the ModelOpt scale
+    # convention and must not imply gate/up layout.
     return prepare_b12x_w4a16_modelopt_nvfp4_weights(
         w1_fp4,
         w1_blockscale,
@@ -141,6 +145,7 @@ def _prepare_b12x_w4a16_modelopt_nvfp4_weights(
         activation=activation,
         params_dtype=params_dtype,
         source_format="modelopt_nvfp4",
+        w13_layout="gate_up",
         reuse_input_storage=False,
     )
 
@@ -665,6 +670,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation=_b12x_activation_name(activation),
             quant_mode=quant_mode,
             source_format="modelopt_nvfp4",
+            w13_layout="gate_up",
             prepared_w4a16=prepared_w4a16,
         )
 
