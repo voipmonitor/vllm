@@ -8,6 +8,25 @@ from typing import Any
 import torch
 
 
+def _record_stream_recursive(obj: Any, stream: torch.cuda.Stream) -> None:
+    """Preserve allocator lifetime for tensors produced on auxiliary streams."""
+    # CUDA graph capture uses a graph-private pool and replays the captured
+    # allocation/use/free ordering. record_stream() is only needed for eager
+    # aux-stream tensors that will be consumed by the current stream after the
+    # Python reference may be dropped.
+    if torch.cuda.is_current_stream_capturing():
+        return
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            obj.record_stream(stream)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            _record_stream_recursive(item, stream)
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            _record_stream_recursive(item, stream)
+
+
 class AuxStreamType(Enum):
     Attention = 1
 
@@ -70,6 +89,7 @@ def maybe_execute_in_parallel(
             result1 = fn1()
             event1.record()
         event1.wait()
+        _record_stream_recursive(result1, torch.cuda.current_stream())
     else:
         result0 = fn0()
         result1 = fn1()
@@ -148,5 +168,9 @@ def execute_in_parallel(
 
     for ev in pending:
         ev.wait()
+
+    consumer_stream = torch.cuda.current_stream()
+    for result in aux_results:
+        _record_stream_recursive(result, consumer_stream)
 
     return default_result, aux_results
