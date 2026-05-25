@@ -957,6 +957,11 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        # Async scheduling can run the next execute_model() while the previous
+        # sample_tokens() is still launching sampler/proposer GPU work. Protect
+        # reused batch metadata from being mutated before the proposer records
+        # its completion event.
+        self._input_prep_sample_lock = threading.Lock()
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
@@ -3793,14 +3798,15 @@ class GPUModelRunner(
             yield
             return
 
-        # Ensure prior step has finished with reused CPU tensors.
-        # This is required in the async scheduling case because
-        # the CPU->GPU transfer happens async.
-        self.prepare_inputs_event.synchronize()
-        try:
-            yield
-        finally:
-            self.prepare_inputs_event.record()
+        with self._input_prep_sample_lock:
+            # Ensure prior step has finished with reused CPU tensors.
+            # This is required in the async scheduling case because
+            # the CPU->GPU transfer happens async.
+            self.prepare_inputs_event.synchronize()
+            try:
+                yield
+            finally:
+                self.prepare_inputs_event.record()
 
     def _model_forward(
         self,
@@ -4667,18 +4673,19 @@ class GPUModelRunner(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        try:
-            return self._sample_tokens_impl(grammar_output)
-        finally:
-            # Re-record the prepare_inputs_event AFTER sample_tokens
-            # (which includes the spec-decode proposer) so the NEXT
-            # batch's execute_model waits for ALL GPU work from this
-            # step -- not just execute_model but also the proposer.
-            # Without this, the batch queue allows the next batch's
-            # _update_states to modify block tables while the current
-            # batch's proposer is still reading them on the GPU.
-            if self.prepare_inputs_event is not None:
-                self.prepare_inputs_event.record()
+        with self._input_prep_sample_lock:
+            try:
+                return self._sample_tokens_impl(grammar_output)
+            finally:
+                # Re-record the prepare_inputs_event AFTER sample_tokens
+                # (which includes the spec-decode proposer) so the NEXT
+                # batch's execute_model waits for ALL GPU work from this
+                # step -- not just execute_model but also the proposer.
+                # Without this, the batch queue allows the next batch's
+                # _update_states to modify block tables while the current
+                # batch's proposer is still reading them on the GPU.
+                if self.prepare_inputs_event is not None:
+                    self.prepare_inputs_event.record()
 
     def _sample_tokens_impl(
         self, grammar_output: "GrammarOutput | None"
