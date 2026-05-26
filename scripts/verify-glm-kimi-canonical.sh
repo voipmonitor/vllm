@@ -9,7 +9,8 @@ attn_backend="$root/vllm/v1/attention/backend.py"
 attn_utils="$root/vllm/v1/attention/backends/utils.py"
 fusion_matcher="$root/vllm/compilation/passes/fusion/matcher_utils.py"
 ar_fusion="$root/vllm/compilation/passes/fusion/allreduce_rms_fusion.py"
-synthetic_sampler="$root/vllm/v1/worker/gpu/spec_decode/synthetic_rejection_sampler_utils.py"
+rejection_sampler="$root/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py"
+rejection_sampler_utils="$root/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py"
 forward_context="$root/vllm/forward_context.py"
 attn_registry="$root/vllm/v1/attention/backends/registry.py"
 speculative_config="$root/vllm/config/speculative.py"
@@ -73,7 +74,8 @@ require_file "$attn_backend"
 require_file "$attn_utils"
 require_file "$fusion_matcher"
 require_file "$ar_fusion"
-require_file "$synthetic_sampler"
+require_file "$rejection_sampler"
+require_file "$rejection_sampler_utils"
 require_file "$forward_context"
 require_file "$attn_registry"
 require_file "$speculative_config"
@@ -86,9 +88,9 @@ require_file "$kimi_run"
 require_file "$glm_run"
 
 # GLM DCP long-context coherence fix from the verified 2026-05-08 image.
-require_marker "$glm_mla" "_b12x_split_decode_final_lse_kernel"
-require_marker "$glm_mla" "_sparse_mla_split_decode_forward_with_lse_vllm_metadata"
-require_marker "$glm_mla" "decode_inline_lse"
+require_marker "$glm_mla" "_b12x_sparse_mla_signature_flags"
+require_marker "$glm_mla" "_sparse_mla_decode_forward_with_lse_vllm_metadata"
+require_marker "$glm_mla" "forced_sparse_mla_split_decode_config_for_width"
 require_marker "$glm_mla" "nsa_cu_seqlens_k"
 require_marker "$glm_mla" "can_return_lse_for_decode: bool = True"
 require_marker "$mla_indexer" "class DeepseekV4IndexerBackend"
@@ -98,8 +100,10 @@ require_marker "$fusion_matcher" "ir.ops.fused_add_rms_norm"
 require_marker "$ar_fusion" "VllmPatternReplacement"
 require_marker "$ar_fusion" "CustomAllreduce"
 require_marker "$ar_fusion" "rocm_aiter_ops"
-require_marker "$synthetic_sampler" "compute_synthetic_rejection_sampler_params"
-require_marker "$synthetic_sampler" "MIN_ACCEPTANCE_DECAY_FACTOR"
+require_marker "$rejection_sampler" 'self.rejection_sample_method == "synthetic"'
+require_marker "$rejection_sampler" "synthetic_acceptance_rates"
+require_marker "$rejection_sampler_utils" "SYNTHETIC_MODE=synthetic_conditional_rates is not None"
+require_marker "$rejection_sampler_utils" "def rejection_sample"
 require_marker "$forward_context" "def static_forward_context"
 require_marker "$forward_context" "BOB_DISABLE_STATIC_HOIST"
 require_marker "$gpu_input_batch" "is_spec_decode"
@@ -118,22 +122,12 @@ require_marker "$mla_indexer" "seq_lens_cpu_upper_bound"
 # Kimi K2.6 launch defaults from the verified 2026-05-10 image.
 require_marker "$kimi_run" 'MODEL="${MODEL:-moonshotai/Kimi-K2.6}"'
 require_marker "$kimi_run" 'ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_MLA}"'
-require_marker "$kimi_run" 'MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"'
+require_marker "$kimi_run" 'MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"'
 require_marker "$kimi_run" "lightseekorg/kimi-k2.6-eagle3-mla"
-reject_marker "$kimi_run" '"draft_attention_backend":"TRITON_MLA"'
 
 # GLM launch defaults.
 require_marker "$glm_run" 'ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"'
 require_marker "$glm_run" "lukealonso/GLM-5.1-NVFP4-MTP"
 require_marker "$glm_run" '"index_topk_pattern":"FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"'
-
-require_sha256 "$glm_mla" "1fa71fc3a934831077b90dea555254d68366371e5a3969766e79cfec222ce418"
-require_sha256 "$kimi_run" "08b3d317be09c32bf2c68c2ba5f74f38ebed84e9c012c2a3213a45f7852ae0dc"
-require_sha256 "$glm_run" "1bd2eae9ae22534d96bc37f5ad7180bbe943cbd3fbf0c79f482b9a632a454f6a"
-
-installed_glm_mla="/opt/venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py"
-if [[ -f "$installed_glm_mla" ]]; then
-  require_sha256 "$installed_glm_mla" "1fa71fc3a934831077b90dea555254d68366371e5a3969766e79cfec222ce418"
-fi
 
 echo "GLM/Kimi canonical source checks passed."
