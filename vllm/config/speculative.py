@@ -118,6 +118,37 @@ def _has_serialized_glm_nextn_fp4_experts(hf_config: PretrainedConfig) -> bool:
     return required.issubset(weight_map)
 
 
+def _has_serialized_glm_nextn_awq_experts(hf_config: PretrainedConfig) -> bool:
+    model_path = None
+    for attr in ("_name_or_path", "name_or_path"):
+        model_path = _resolve_cached_hf_model_path(getattr(hf_config, attr, None))
+        if model_path:
+            break
+    if model_path is None:
+        return False
+
+    nextn_layer_id = getattr(hf_config, "num_hidden_layers", None)
+    if nextn_layer_id is None:
+        return False
+
+    prefix = f"model.layers.{nextn_layer_id}.mlp.experts.0.down_proj"
+    required = {
+        f"{prefix}.qweight",
+        f"{prefix}.qzeros",
+        f"{prefix}.scales",
+    }
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return False
+
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+    except Exception:
+        return False
+    return required.issubset(weight_map)
+
+
 def _extend_unique(values: list[str], additions: list[str]) -> None:
     seen = set(values)
     for value in additions:
@@ -439,7 +470,10 @@ class SpeculativeConfig:
                     has_serialized_nextn_experts = (
                         mtp_start is not None
                         and mtp_layers
-                        and _has_serialized_glm_nextn_fp4_experts(hf_config)
+                        and (
+                            _has_serialized_glm_nextn_fp4_experts(hf_config)
+                            or _has_serialized_glm_nextn_awq_experts(hf_config)
+                        )
                     )
                     if mtp_start is not None and mtp_layers:
                         unquantized_mtp_prefixes = []

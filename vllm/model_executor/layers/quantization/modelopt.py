@@ -119,6 +119,8 @@ QUANT_ALGOS = [
     "MXFP8",
     # MIXED_PRECISION,
     "MIXED_PRECISION",
+    # AWQ base checkpoint with ModelOpt MXFP8 sparse-expert overrides.
+    "MIXED_AWQ_MXFP8",
 ]
 KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
 
@@ -266,7 +268,11 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         """
         if hf_quant_cfg is None:
             return None
-        if not hf_quant_cfg.get("quant_method", "").lower().startswith("modelopt"):
+        quant_method = hf_quant_cfg.get("quant_method", "").lower()
+        if not (
+            quant_method.startswith("modelopt")
+            or quant_method == "awq_modelopt_mixed"
+        ):
             return None
         if "quantization" in hf_quant_cfg:
             quant_config = hf_quant_cfg["quantization"]
@@ -1895,7 +1901,7 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> QuantizationMethods | None:
         algo = cls._extract_modelopt_quant_algo(hf_quant_cfg)
-        if algo is not None and "MXFP8" in algo:
+        if algo is not None and algo == "MXFP8":
             return "modelopt_mxfp8"
         return None
 
@@ -2037,17 +2043,25 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
-    """FlashInfer TRTLLM MXFP8 block-scale MoE for ModelOpt checkpoints."""
+    """MXFP8 block-scale MoE for ModelOpt checkpoints."""
 
     def __init__(
         self,
         quant_config: ModelOptMxFp8Config,
         moe_config: FusedMoEConfig,
     ) -> None:
-        super().__init__(moe_config)
-        self.weight_block_size = [1, MXFP8_BLOCK_SIZE]
+        # Mixed NVFP4/MXFP8 checkpoints run with global moe_backend=b12x so
+        # NVFP4 layers keep the B12X backend. MXFP8 layers have their own
+        # supported backends, so select one automatically for this layer only.
+        mxfp8_moe_config = (
+            replace(moe_config, moe_backend="auto")
+            if moe_config.moe_backend == "b12x"
+            else moe_config
+        )
+        super().__init__(mxfp8_moe_config)
         self.quant_config = quant_config
         assert self.quant_config.is_checkpoint_mxfp8_serialized
+        self.weight_block_size = [1, MXFP8_BLOCK_SIZE]
 
         self.mxfp8_backend, self.experts_cls = select_mxfp8_moe_backend(config=self.moe)
 
@@ -2143,6 +2157,8 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             layer.w2_weight_scale,
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
         )
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
 
     @staticmethod
     def _check_weight_dtypes(layer: torch.nn.Module) -> None:
@@ -2248,7 +2264,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         # TODO(bnell): why is this required only for mxfp8?
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
-        layer._already_called_process_weights_after_loading = True
 
         self._check_weight_dtypes(layer)
 
@@ -2280,6 +2295,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        layer._already_called_process_weights_after_loading = True
 
     def maybe_make_prepare_finalize(
         self,
@@ -2307,9 +2323,10 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             fp8_backend=self.mxfp8_backend,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            a1_scale=None,
-            a2_scale=None,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def apply_monolithic(
@@ -2387,6 +2404,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         fp8_pb_wo_config: ModelOptFp8Config,
         nvfp4_config: ModelOptNvFp4Config,
         w4a16_nvfp4_config: ModelOptNvFp4Config,
+        mxfp8_config: ModelOptMxFp8Config,
+        base_quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
@@ -2395,6 +2414,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.fp8_pb_wo_config = fp8_pb_wo_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
+        self.mxfp8_config = mxfp8_config
+        self.base_quant_config = base_quant_config
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
@@ -2411,7 +2432,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> QuantizationMethods | None:
         algo = cls._extract_modelopt_quant_algo(hf_quant_cfg)
-        if algo is not None and algo == "MIXED_PRECISION":
+        if algo is not None and algo in ("MIXED_PRECISION", "MIXED_AWQ_MXFP8"):
             return "modelopt_mixed"
         return None
 
@@ -2432,6 +2453,35 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             )
         else:
             quantized_layers = original_config.get("quantized_layers", {})
+
+        base_quant_config: QuantizationConfig | None = None
+        if quant_method == "MIXED_AWQ_MXFP8":
+            quantized_layers = dict(original_config.get("mxfp8_overrides", {}))
+            if not quantized_layers:
+                config_groups = original_config.get("config_groups", {})
+                mxfp8_group = config_groups.get("group_mxfp8_sparse_experts", {})
+                weights_cfg = mxfp8_group.get("weights", {})
+                quantized_layers = {
+                    target: {
+                        "quant_algo": "MXFP8",
+                        "quant_method": "modelopt",
+                        **weights_cfg,
+                    }
+                    for target in mxfp8_group.get("targets", [])
+                }
+
+            awq_config_dict = original_config.get("base_quantization_config", {})
+            if not awq_config_dict:
+                raise ValueError(
+                    "MIXED_AWQ_MXFP8 requires 'base_quantization_config'."
+                )
+            from .awq import AWQConfig
+            from .awq_marlin import AWQMarlinConfig
+
+            if AWQMarlinConfig.is_awq_marlin_compatible(awq_config_dict):
+                base_quant_config = AWQMarlinConfig.from_config(awq_config_dict)
+            else:
+                base_quant_config = AWQConfig.from_config(awq_config_dict)
 
         if not quantized_layers:
             raise ValueError(
@@ -2483,6 +2533,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             exclude_modules=[],
             group_size=group_size,
         )
+        mxfp8_config = ModelOptMxFp8Config(
+            is_checkpoint_mxfp8_serialized=True,
+            kv_cache_quant_algo=kv_cache_quant_method,
+            exclude_modules=[],
+        )
 
         return cls(
             kv_cache_quant_method=kv_cache_quant_method,
@@ -2492,6 +2547,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             fp8_pb_wo_config=fp8_pb_wo_config,
             nvfp4_config=nvfp4_config,
             w4a16_nvfp4_config=w4a16_nvfp4_config,
+            mxfp8_config=mxfp8_config,
+            base_quant_config=base_quant_config,
         )
 
     def _resolve_quant_algo(self, prefix: str) -> str | None:
@@ -2585,7 +2642,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
-            # Layer not in quantized_layers — leave unquantized
+            if quant_algo == "MXFP8":
+                return ModelOptMxFp8LinearMethod(self.mxfp8_config)
+            if self.base_quant_config is not None:
+                return self.base_quant_config.get_quant_method(layer, prefix)
+            # Layer not in quantized_layers — leave unquantized.
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):
@@ -2609,6 +2670,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     quant_config=self.w4a16_nvfp4_config,
                     moe_config=layer.moe_config,
                 )
+            if quant_algo == "MXFP8":
+                return ModelOptMxFp8FusedMoE(
+                    quant_config=self.mxfp8_config,
+                    moe_config=layer.moe_config,
+                )
+            if self.base_quant_config is not None:
+                return self.base_quant_config.get_quant_method(layer, prefix)
             return None
 
         return None
@@ -2617,3 +2685,5 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().apply_vllm_mapper(hf_to_vllm_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_vllm_mapper.apply_dict(self.quantized_layers)
+        if self.base_quant_config is not None:
+            self.base_quant_config.apply_vllm_mapper(hf_to_vllm_mapper)

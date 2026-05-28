@@ -306,12 +306,14 @@ def get_quant_config(
         # (e.g. for activation overrides via the MXFP4 oracle).
 
         # For modelopt_mixed, config.json's quantization_config may or may
-        # not contain the per-layer quantized_layers map.  Newer checkpoints
-        # embed it directly; older ones keep it only in hf_quant_config.json.
-        # If it is missing, fall through to the file-based loading path.
+        # not contain the per-layer quantized_layers map. Newer ModelOpt
+        # checkpoints embed it directly; older ones keep it only in
+        # hf_quant_config.json. The AWQ+MXFP8 hybrid format instead embeds
+        # sparse-expert overrides as mxfp8_overrides.
         if (
             model_config.quantization == "modelopt_mixed"
             and "quantized_layers" not in hf_quant_config
+            and "mxfp8_overrides" not in hf_quant_config
         ):
             pass  # fall through to file-based loading below
         else:
