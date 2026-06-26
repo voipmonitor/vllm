@@ -877,7 +877,34 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # kernels see the same (B, next_n) layout as the MTP path.
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
-            decode_topk_max_seq_len = int(seq_lens.max().item())
+
+            active_width = None
+            active_width_tokens = None
+            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+                # Live scorer window in cache tokens. ceil(max_seq_len /
+                # compress_ratio) is an upper bound on the max compressed
+                # context across the batch, so windowing to it is top-k-identical
+                # to the capacity cap and only skips wasted k-tiles. Computed on
+                # the host here (metadata-prep, outside cudagraph capture) and
+                # filled into the persistent buffer the captured kernel reads.
+                active_width_tokens = -(
+                    -int(common_attn_metadata.max_seq_len) // self.compress_ratio
+                )
+                self.b12x_active_width_buffer.fill_(active_width_tokens)
+                active_width = self.b12x_active_width_buffer
+                if self.compress_ratio > 1:
+                    # Compressed-MLA models already bound the B12X scorer with
+                    # active_width. Avoiding a host reduction here removes a
+                    # per-decode sync without changing the scorer window.
+                    decode_topk_max_seq_len = active_width_tokens
+                else:
+                    # GLM/Kimi-style uncompressed indexer rows still use this
+                    # host scalar in non-B12X paths and benchmarks show the
+                    # conservative active-width upper bound regresses GLM
+                    # decode throughput. Keep the exact scalar there.
+                    decode_topk_max_seq_len = int(seq_lens.max().item())
+            else:
+                decode_topk_max_seq_len = int(seq_lens.max().item())
 
             if envs.VLLM_USE_B12X_SPARSE_INDEXER:
                 schedule_metadata = self._maybe_build_b12x_schedule_metadata(
@@ -891,20 +918,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata = self._maybe_build_deep_gemm_schedule_metadata(
                     seq_lens
                 )
-
-            active_width = None
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
-                # Live scorer window in cache tokens. ceil(max_seq_len /
-                # compress_ratio) is an upper bound on the max compressed
-                # context across the batch, so windowing to it is top-k-identical
-                # to the capacity cap and only skips wasted k-tiles. Computed on
-                # the host here (metadata-prep, outside cudagraph capture) and
-                # filled into the persistent buffer the captured kernel reads.
-                active_width_tokens = -(
-                    -int(common_attn_metadata.max_seq_len) // self.compress_ratio
-                )
-                self.b12x_active_width_buffer.fill_(active_width_tokens)
-                active_width = self.b12x_active_width_buffer
 
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
