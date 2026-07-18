@@ -1415,6 +1415,22 @@ def get_dcp_group() -> GroupCoordinator:
     return _DCP
 
 
+_QUERY_SPLIT: GroupCoordinator | None = None
+
+
+def get_query_split_group() -> GroupCoordinator:
+    assert _QUERY_SPLIT is not None, "query split group is not initialized"
+    return _QUERY_SPLIT
+
+
+_DCP_CKV_PREFETCH: GroupCoordinator | None = None
+
+
+def get_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    assert _DCP_CKV_PREFETCH is not None, "DCP ckv prefetch group is not initialized"
+    return _DCP_CKV_PREFETCH
+
+
 _PP: GroupCoordinator | None = None
 
 
@@ -1886,6 +1902,39 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
+    # Build the query-split groups for the indexer query split (Fix A).
+    # Ranks sharing the same dcp_rank (position within their DCP group)
+    # form a query-split group.  At TP=8/DCP=2 the DCP groups are
+    # {0,1},{2,3},{4,5},{6,7} and the query-split groups are
+    # {0,2,4,6} (dcp_rank=0) and {1,3,5,7} (dcp_rank=1).
+    global _QUERY_SPLIT
+    assert _QUERY_SPLIT is None, "query split group is already initialized"
+    if decode_context_model_parallel_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
+        query_split_ranks: list[list[int]] = []
+        for dcp_rank_idx in range(decode_context_model_parallel_size):
+            query_split_ranks.append([grp[dcp_rank_idx] for grp in group_ranks])
+        _QUERY_SPLIT = init_model_parallel_group(
+            query_split_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="query_split",
+        )
+
+    # A dedicated communicator over the DCP ranks for the transient ckv
+    # prefetch gather (Fix B). The prefetch runs on a side stream and would
+    # otherwise share the DCP communicator with the indexer's DCP top-k
+    # merge on the default stream; concurrent collectives on one NCCL
+    # communicator from two streams is unsupported. Same ranks as ``_DCP``.
+    global _DCP_CKV_PREFETCH
+    assert _DCP_CKV_PREFETCH is None, "DCP ckv prefetch group is already initialized"
+    if decode_context_model_parallel_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
+        _DCP_CKV_PREFETCH = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="dcp_ckv_prefetch",
+        )
+
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
@@ -2110,6 +2159,16 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _QUERY_SPLIT
+    if _QUERY_SPLIT:
+        _QUERY_SPLIT.destroy()
+    _QUERY_SPLIT = None
+
+    global _DCP_CKV_PREFETCH
+    if _DCP_CKV_PREFETCH:
+        _DCP_CKV_PREFETCH.destroy()
+    _DCP_CKV_PREFETCH = None
 
     global _PCP
     if _PCP:

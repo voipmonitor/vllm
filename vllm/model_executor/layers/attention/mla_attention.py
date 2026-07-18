@@ -986,13 +986,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             dcp_use_a2a = False
             project_before_merge = False
             workspace_gather_used = False
+            ckv_gather_used = False
             if self.impl.dcp_world_size > 1:
-                if not self.impl.can_return_lse_for_decode:
-                    raise NotImplementedError(
-                        f"{type(self.impl).__name__} cannot use DCP because it "
-                        "does not return decode softmax LSE."
-                    )
-                self.impl.need_to_return_lse_for_decode = True
+                ckv_gather_selector = getattr(
+                    self.impl, "dcp_prefill_ckv_gather_eligible", None
+                )
+                ckv_gather_used = bool(
+                    callable(ckv_gather_selector)
+                    and ckv_gather_selector(attn_metadata, num_mqa_tokens)
+                )
+                if not ckv_gather_used:
+                    if not self.impl.can_return_lse_for_decode:
+                        raise NotImplementedError(
+                            f"{type(self.impl).__name__} cannot use DCP because it "
+                            "does not return decode softmax LSE."
+                        )
+                    self.impl.need_to_return_lse_for_decode = True
                 if (
                     fp8_attention
                     and isinstance(mqa_q, torch.Tensor)
@@ -1017,7 +1026,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
                 # The project-before path currently targets eager AG/RS
                 # prefill. A2A retains its established merge-then-project path.
-                project_before_merge = use_ondemand_w_uv and not dcp_use_a2a
+                project_before_merge = (
+                    use_ondemand_w_uv and not dcp_use_a2a and not ckv_gather_used
+                )
                 workspace_gather_eligible = _can_use_b12x_dcp_prefill_workspace(
                     enabled=envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE,
                     project_before_merge=project_before_merge,
@@ -1031,11 +1042,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     backend_name=self.attn_backend.get_name(),
                     is_capturing=torch.cuda.is_current_stream_capturing(),
                 )
-                if isinstance(mqa_q, tuple) and not workspace_gather_eligible:
-                    # Ordinary communicators require one contiguous query.
+                if (
+                    isinstance(mqa_q, tuple)
+                    and not workspace_gather_eligible
+                    and not ckv_gather_used
+                ):
                     mqa_q = torch.cat(mqa_q, dim=-1)
-                # mqa_q do allgather in head dim.
-                if dcp_use_b12x:
+                if ckv_gather_used:
+                    logger.info_once(
+                        "Keeping local query heads for transient full-CKV "
+                        "B12X sparse MLA prefill"
+                    )
+                elif dcp_use_b12x:
                     mqa_q = dcp_b12x_all_gather_heads(
                         mqa_q,
                         get_dcp_group(),
@@ -1070,10 +1088,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # call decode attn
             if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
+            if ckv_gather_used:
+                ckv_setter = getattr(self.impl, "set_ckv_current_chunk_kv", None)
+                if callable(ckv_setter):
+                    ckv_setter(k_c_normed, k_pe)
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
+            if self.impl.dcp_world_size > 1 and not ckv_gather_used:
                 if lse is None:
                     raise RuntimeError(
                         f"{type(self.impl).__name__} did not return decode "
@@ -1401,13 +1423,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and num_hidden_layers is not None
             and layer_id >= int(num_hidden_layers)
         )
-        model_type = getattr(
-            vllm_config.model_config.hf_config, "model_type", None
-        )
+        model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
         speculative_config = getattr(vllm_config, "speculative_config", None)
-        target_model_config = getattr(
-            speculative_config, "target_model_config", None
-        )
+        target_model_config = getattr(speculative_config, "target_model_config", None)
         target_model_type = (
             getattr(target_model_config.hf_config, "model_type", None)
             if target_model_config is not None
@@ -1415,10 +1433,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         glm_model_or_mtp = bool(
             model_type == "glm_moe_dsa"
-            or (
-                model_type == "deepseek_mtp"
-                and target_model_type == "glm_moe_dsa"
-            )
+            or (model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa")
         )
         glm_fp8_rope = bool(
             os.environ.get("KV_FP8_ROPE", "0") == "1"
@@ -1535,8 +1550,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         for start in range(0, num_tokens, max_chunk_tokens):
             end = min(start + max_chunk_tokens, num_tokens)
             self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
-
-
 
 
 def unified_mla_kv_cache_update(
