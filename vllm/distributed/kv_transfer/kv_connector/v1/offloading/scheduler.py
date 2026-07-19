@@ -306,9 +306,12 @@ class RequestOffloadState:
             group_state.block_ids.extend(new_blocks)
 
     def storable_chunks(
-        self, group_config: "GroupOffloadConfig", num_offloadable_tokens: int
+        self,
+        group_config: "GroupOffloadConfig",
+        group_state: RequestGroupState,
+        num_offloadable_tokens: int,
     ) -> int:
-        """Number of leading offloaded chunks eligible for store.
+        """Number of leading chunks whose keys and source blocks are ready.
 
         For eagle/MTP groups the volatile trailing chunk of the offloadable
         range is excluded while decoding: the draft-layer KV of the last
@@ -320,23 +323,40 @@ class RequestOffloadState:
         each step is skipped on collection but jumped over by
         ``next_stored_chunk_idx``, so it is never re-considered and a
         permanent hole breaks prefix-reuse lookup.
+
+        Async scheduling can expose token progress before either hashes or a
+        complete source-block chunk is tracked. Limit the cursor to their
+        common ready prefix so the missing chunk is retried on a later step.
         """
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
         if group_config.is_eagle_group and is_decoding:
             num_chunks = max(0, num_chunks - 1)
-        return num_chunks
+        num_ready_chunks = min(
+            len(group_state.offload_keys),
+            len(group_state.block_ids) // self.config.blocks_per_chunk,
+        )
+        if num_ready_chunks < num_chunks:
+            logger.debug(
+                "Request %s deferring group %d offload chunks: "
+                "storable=%d keys=%d tracked_blocks=%d",
+                self.req.request_id,
+                group_config.group_idx,
+                num_chunks,
+                len(group_state.offload_keys),
+                len(group_state.block_ids),
+            )
+        return min(num_chunks, num_ready_chunks)
 
     def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
-        # max(): at the prefill->decode transition of a chunk-aligned prompt,
-        # storable_chunks drops by one (the eagle exclusion kicks in), and the
-        # index must not move backwards past already-stored chunks.
+        # Keep the cursor monotonic: the EAGLE exclusion can lower a group's
+        # storable boundary at the prefill-to-decode transition.
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
             group_state.next_stored_chunk_idx = max(
                 group_state.next_stored_chunk_idx,
-                self.storable_chunks(group_config, num_offloadable_tokens),
+                self.storable_chunks(group_config, group_state, num_offloadable_tokens),
             )
 
     def update_num_hit_chunks(self, num_cached_tokens: int) -> None:
@@ -955,9 +975,8 @@ class OffloadingConnectorScheduler:
                 self.config.kv_group_configs, req_status.group_states
             ):
                 num_chunks = req_status.storable_chunks(
-                    group_config, num_offloadable_tokens
+                    group_config, group_state, num_offloadable_tokens
                 )
-
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 if num_chunks <= start_chunk_idx:
                     continue
@@ -1032,7 +1051,7 @@ class OffloadingConnectorScheduler:
                     group_config.sliding_window_size_in_chunks is not None
                 )
                 num_chunks = req_status.storable_chunks(
-                    group_config, num_offloadable_tokens
+                    group_config, group_state, num_offloadable_tokens
                 )
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 block_ids = group_state.block_ids
