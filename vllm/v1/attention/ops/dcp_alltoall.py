@@ -170,9 +170,17 @@ def _get_b12x_dcp_a2a_pool(
 @contextmanager
 def capture_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
-    stream: object = None,
+    stream: torch.cuda.Stream | None = None,
 ):
-    """Bind each CUDA graph manager to independent B12X DCP channels."""
+    """Bind registered SparkInfer DCP pools to the graph's owning stream.
+
+    Each graph capture receives independent channels; reusing channels across
+    target and draft graphs would make one graph depend on another's lifetime.
+
+    Args:
+        cp_group: DCP group whose registered pools should enter capture.
+        stream: CUDA stream owned by the enclosing graph capture.
+    """
     group_id = id(cp_group.device_group)
     matching_pools = sorted(
         (
@@ -186,6 +194,39 @@ def capture_b12x_dcp_a2a(
         for _, pool in matching_pools:
             stack.enter_context(pool.capture(stream=stream))
         yield
+
+
+def checkpoint_b12x_dcp_a2a_channels(
+    cp_group: GroupCoordinator,
+) -> tuple[int, dict[Any, tuple[Any, Any]]]:
+    """Snapshot SparkInfer DCP pools before a disposable graph capture."""
+    group_id = id(cp_group.device_group)
+    checkpoints = {
+        key: (pool, pool.checkpoint_channels())
+        for key, pool in _B12X_DCP_A2A_POOLS.items()
+        if key[0] == group_id
+    }
+    return group_id, checkpoints
+
+
+def rollback_b12x_dcp_a2a_channels(
+    checkpoint: tuple[int, dict[Any, tuple[Any, Any]]],
+) -> None:
+    """Restore DCP pools after their disposable graphs are destroyed."""
+    group_id, checkpoints = checkpoint
+    for key, pool in list(_B12X_DCP_A2A_POOLS.items()):
+        if key[0] != group_id:
+            continue
+        saved = checkpoints.get(key)
+        if saved is None:
+            pool.close()
+            del _B12X_DCP_A2A_POOLS[key]
+            continue
+        saved_pool, channel_checkpoint = saved
+        if pool is not saved_pool:
+            pool.close()
+            _B12X_DCP_A2A_POOLS[key] = saved_pool
+        saved_pool.rollback_channels(channel_checkpoint)
 
 
 def _try_b12x_dcp_lse_reduce(

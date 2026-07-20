@@ -644,10 +644,11 @@ class CustomAllreduce:
 
     @contextmanager
     def capture(self, stream: torch.cuda.Stream | None = None):
-        """
-        The main responsibility of this context manager is the
-        `register_graph_buffers` call at the end of the context.
-        It records all the buffer addresses used in the CUDA graph.
+        """Bind communicator resources to the enclosing CUDA graph capture.
+
+        Legacy custom all-reduce registers graph buffers on exit. SparkInfer
+        PCIe channels are instead created on the graph's owning stream and
+        remain valid for the graph lifetime.
         """
         old_pcie_capture_stream = self._pcie_capture_stream
         try:
@@ -663,6 +664,34 @@ class CustomAllreduce:
             self._IS_CAPTURING = False
             if not self.disabled and self._pcie_runtime is None:
                 self.register_graph_buffers()
+
+    def checkpoint_pcie_channels(self) -> Any | None:
+        """Snapshot SparkInfer PCIe channels before a disposable capture.
+
+        Returns:
+            An opaque runtime checkpoint, or ``None`` when PCIe all-reduce is
+            unavailable.
+        """
+        runtime = self._pcie_runtime
+        checkpoint = getattr(runtime, "checkpoint_channels", None)
+        if checkpoint is None:
+            return None
+        return checkpoint()
+
+    def rollback_pcie_channels(self, checkpoint: Any) -> None:
+        """Release SparkInfer PCIe channels created after ``checkpoint``.
+
+        Args:
+            checkpoint: Opaque state returned by ``checkpoint_pcie_channels``.
+
+        Raises:
+            RuntimeError: If the SparkInfer PCIe runtime is unavailable.
+        """
+        runtime = self._pcie_runtime
+        rollback = getattr(runtime, "rollback_channels", None)
+        if rollback is None:
+            raise RuntimeError("SparkInfer PCIe all-reduce runtime is unavailable")
+        rollback(checkpoint)
 
     def _pcie_runtime_stream(self) -> torch.cuda.Stream | None:
         pinned = self._pcie_capture_stream
