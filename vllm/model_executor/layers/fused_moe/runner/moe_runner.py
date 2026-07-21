@@ -296,11 +296,16 @@ class MoERunner(MoERunnerInterface):
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
             can_overlap = lambda: self._quant_method.mk_can_overlap_shared_experts
+
+            def supports_aux_stream(num_tokens: int) -> bool:
+                return self._quant_method.supports_shared_experts_aux_stream(num_tokens)
+
             self._shared_experts = SharedExperts(
                 shared_experts,
                 moe_config=moe_config,
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
+                experts_support_aux_stream=supports_aux_stream,
             )
 
         # Needed for string -> MoERunner layer lookup in custom ops.
@@ -600,6 +605,10 @@ class MoERunner(MoERunnerInterface):
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
             fused_out = self.routed_experts.forward_monolithic(
                 x=hidden_states,
                 router_logits=router_logits,
@@ -614,6 +623,14 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
+            # The auxiliary launch was queued before gate/router work. Join it
+            # only after routing, immediately before the routed kernel, to keep
+            # resident-grid plans isolated without serializing independent work.
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
+
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -621,11 +638,6 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
-
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-        )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,

@@ -43,6 +43,7 @@ class SharedExperts(torch.nn.Module):
         moe_config: FusedMoEConfig,
         enable_dbo: bool,
         mk_can_overlap_shared_experts: Callable[[], bool],
+        experts_support_aux_stream: Callable[[int], bool],
     ):
         super().__init__()
 
@@ -56,6 +57,7 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
+        self._experts_support_aux_stream = experts_support_aux_stream
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -99,6 +101,7 @@ class SharedExperts(torch.nn.Module):
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
+            and self._experts_support_aux_stream(int(hidden_states.shape[0]))
             and hidden_states.shape[0]
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
         )
@@ -116,6 +119,7 @@ class SharedExperts(torch.nn.Module):
 
         if experts_order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             assert self._stream is not None
+            assert self._output[self._output_idx] is None
 
             # Record that the clone will be used by shared_experts_stream
             # to avoid gc issue from deallocation of hidden_states_clone
@@ -126,15 +130,15 @@ class SharedExperts(torch.nn.Module):
             # run in parallel with router/gate.
             self._stream.wait_stream(current_stream())
 
-    def _run_in_aux_stream(
-        self,
-        shared_experts_input: torch.Tensor,
-    ) -> torch.Tensor:
-        # TODO: assert that maybe_sync_shared_experts_stream has been called.
+            # Submit the shared expert before gate/router work. The consumer
+            # stream is joined later, immediately before the routed kernel, so
+            # resident-grid kernels never execute concurrently with this work.
+            with torch.cuda.stream(self._stream):
+                self._output[self._output_idx] = self._layer(shared_experts_input)
 
-        # Run shared experts in parallel on a separate stream.
-        with torch.cuda.stream(self._stream):
-            output = self._layer(shared_experts_input)
+    def _join_aux_stream(self) -> None:
+        output = self._output[self._output_idx]
+        assert output is not None
         consumer_stream = current_stream()
         consumer_stream.wait_stream(self._stream)
 
@@ -143,8 +147,6 @@ class SharedExperts(torch.nn.Module):
         # orders producer before consumer; record_stream keeps the allocation
         # alive until the consumer has finished using it.
         output.record_stream(consumer_stream)
-
-        return output
 
     @property
     def _output_idx(self) -> int:
@@ -167,13 +169,10 @@ class SharedExperts(torch.nn.Module):
         if order != experts_order:
             return None
 
-        assert self._output[self._output_idx] is None
-
         if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
-            self._output[self._output_idx] = self._run_in_aux_stream(
-                shared_experts_input
-            )
+            self._join_aux_stream()
         else:
+            assert self._output[self._output_idx] is None
             self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None
