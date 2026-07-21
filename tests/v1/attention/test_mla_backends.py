@@ -62,6 +62,80 @@ BACKENDS_TO_TEST = [
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.cpu_test
+def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_lora_rank = 2
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 3
+    layer.v_head_dim = 4
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.qweight = torch.nn.Parameter(
+        torch.ones((14, 2), dtype=torch.int8), requires_grad=False
+    )
+    layer.kv_b_proj.quant_method = object()
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.quant_config = None
+    layer.layer_name = "test"
+    dequantized = torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
+    events = []
+    preallocated = []
+    preallocate = mla_attention_module._preallocate_absorbed_mla_weights
+
+    def track_preallocation(*args, **kwargs):
+        events.append("preallocate")
+        weights = preallocate(*args, **kwargs)
+        preallocated.extend(weights)
+        return weights
+
+    def fake_dequant(*args, **kwargs):
+        events.append("dequantize")
+        return dequantized
+
+    monkeypatch.setattr(
+        mla_attention_module,
+        "_preallocate_absorbed_mla_weights",
+        track_preallocation,
+    )
+    monkeypatch.setattr(
+        mla_attention_module, "get_and_maybe_dequant_weights", fake_dequant
+    )
+    monkeypatch.setattr(
+        mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
+    )
+
+    with torch.no_grad():
+        layer.process_weights_after_loading(torch.float32)
+
+    assert events == ["preallocate", "dequantize"]
+    assert layer.W_UV.data_ptr() == preallocated[0].data_ptr()
+    assert layer.W_UK_T.data_ptr() == preallocated[1].data_ptr()
+    assert layer.W_UV.device == layer.kv_b_proj.qweight.device
+    assert layer.W_UK_T.device == layer.kv_b_proj.qweight.device
+
+
+@pytest.mark.cpu_test
+def test_mla_absorbed_weight_preallocation_reuses_compatible_storage():
+    layer = SimpleNamespace(
+        kv_lora_rank=2,
+        num_heads=2,
+        qk_nope_head_dim=3,
+        v_head_dim=4,
+        kv_b_proj=torch.nn.Module(),
+        W_UV=torch.empty((2, 2, 4), dtype=torch.float32),
+        W_UK_T=torch.empty((2, 3, 2), dtype=torch.float32),
+    )
+
+    pre_w_uv, pre_w_uk_t = mla_attention_module._preallocate_absorbed_mla_weights(
+        layer, torch.float32
+    )
+
+    assert pre_w_uv is None
+    assert pre_w_uk_t is None
+
+
 @pytest.mark.parametrize(
     ("cache_dtype", "expected_quant_mode"),
     [

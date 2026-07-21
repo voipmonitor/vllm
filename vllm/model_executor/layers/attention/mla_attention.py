@@ -293,6 +293,91 @@ logger = init_logger(__name__)
 _FP8_DTYPE = current_platform.fp8_dtype()
 
 
+def _find_linear_weight_device(layer: torch.nn.Module) -> torch.device | None:
+    """Find the device that owns a linear layer's loaded weights.
+
+    Args:
+        layer: Linear layer or a wrapper around one.
+
+    Returns:
+        The loaded weight device, or ``None`` when the layer owns no tensors.
+    """
+    while hasattr(layer, "base_layer") and hasattr(layer.base_layer, "quant_method"):
+        layer = layer.base_layer
+
+    for name in ("weight", "qweight", "weight_packed"):
+        weight = getattr(layer, name, None)
+        if isinstance(weight, torch.Tensor):
+            return weight.device
+    for parameter in layer.parameters(recurse=False):
+        return parameter.device
+    for buffer in layer.buffers(recurse=False):
+        return buffer.device
+    return None
+
+
+def _preallocate_absorbed_mla_weights(
+    layer: "MLAAttention", act_dtype: torch.dtype
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Allocate persistent MLA weights before temporary dequantization storage.
+
+    Compatible weights from an earlier load are reused in place, preserving
+    their addresses for CUDA graphs.
+
+    Args:
+        layer: MLA attention layer whose KV projection will be absorbed.
+        act_dtype: Data type used by the absorbed projection weights.
+
+    Returns:
+        Optional new storage for ``W_UV`` and ``W_UK_T``, respectively.
+
+    Raises:
+        RuntimeError: If neither the source projection nor reusable absorbed
+            weights identify the target device.
+    """
+    w_uv_shape = (layer.num_heads, layer.kv_lora_rank, layer.v_head_dim)
+    w_uk_t_shape = (
+        layer.num_heads,
+        layer.qk_nope_head_dim,
+        layer.kv_lora_rank,
+    )
+    current_w_uv = getattr(layer, "W_UV", None)
+    current_w_uk_t = getattr(layer, "W_UK_T", None)
+
+    device = _find_linear_weight_device(layer.kv_b_proj)
+    if device is None:
+        current_devices = {
+            weight.device
+            for weight in (current_w_uv, current_w_uk_t)
+            if isinstance(weight, torch.Tensor)
+        }
+        if len(current_devices) != 1:
+            raise RuntimeError(
+                "Cannot determine the device for absorbed MLA projection weights."
+            )
+        device = current_devices.pop()
+
+    def needs_storage(weight: object, shape: tuple[int, ...]) -> bool:
+        return not (
+            isinstance(weight, torch.Tensor)
+            and weight.shape == shape
+            and weight.dtype == act_dtype
+            and weight.device == device
+        )
+
+    pre_w_uv = (
+        torch.empty(w_uv_shape, dtype=act_dtype, device=device)
+        if needs_storage(current_w_uv, w_uv_shape)
+        else None
+    )
+    pre_w_uk_t = (
+        torch.empty(w_uk_t_shape, dtype=act_dtype, device=device)
+        if needs_storage(current_w_uk_t, w_uk_t_shape)
+        else None
+    )
+    return pre_w_uv, pre_w_uk_t
+
+
 def _can_use_b12x_dcp_prefill_workspace(
     *,
     enabled: bool,
@@ -1405,6 +1490,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return output_padded
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
+        pre_w_uv = pre_w_uk_t = None
+        if not (
+            self.is_aiter_triton_fp4_bmm_enabled or self.is_aiter_triton_fp8_bmm_enabled
+        ):
+            # Seat persistent weights before the transient dequantization scratch.
+            pre_w_uv, pre_w_uk_t = _preallocate_absorbed_mla_weights(self, act_dtype)
+
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
         # the bmm's in 16-bit, the extra memory overhead of this is fairly low
@@ -1489,9 +1581,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+            w_uv = W_UV.transpose(0, 1)
+            if pre_w_uv is not None:
+                pre_w_uv.copy_(w_uv)
+                w_uv = pre_w_uv
+            replace_parameter(self, "W_UV", w_uv, prefer_copy=True)
             # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+            w_uk_t = W_UK.permute(1, 2, 0)
+            if pre_w_uk_t is not None:
+                pre_w_uk_t.copy_(w_uk_t)
+                w_uk_t = pre_w_uk_t
+            replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
