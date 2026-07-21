@@ -1439,16 +1439,12 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-def checkpoint_b12x_graph_channels() -> tuple[
-    tuple[Callable[[Any], None], Any], ...
-]:
+def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any], ...]:
     """Snapshot B12X channels used by disposable CUDA graph captures."""
     checkpoints: list[tuple[Callable[[Any], None], Any]] = []
     seen_communicators: set[int] = set()
     for group in (_TP, _DCP, _PP):
-        device_communicator = (
-            None if group is None else group.device_communicator
-        )
+        device_communicator = None if group is None else group.device_communicator
         communicator = getattr(device_communicator, "ca_comm", None)
         if communicator is None or id(communicator) in seen_communicators:
             continue
@@ -1553,10 +1549,20 @@ def graph_capture(
         if _DCP is not None and get_dcp_group().world_size > 1
         else nullcontext()
     )
+    if _DCP is not None and get_dcp_group().world_size > 1:
+        # Import locally to avoid making distributed initialization depend on
+        # attention modules. The helper is a no-op until DCP warmup creates a
+        # B12X pool for this process group.
+        from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
+
+        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)
+    else:
+        maybe_b12x_dcp_capture = nullcontext()
     with (
         get_tp_group().graph_capture(context),
         get_pp_group().graph_capture(context),
         maybe_dcp_capture,
+        maybe_b12x_dcp_capture,
     ):
         yield context
 
