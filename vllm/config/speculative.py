@@ -743,6 +743,28 @@ class SpeculativeConfig:
         if self.code_revision is None:
             self.code_revision = target.code_revision
 
+    def _cap_same_model_draft_position_embeddings(self) -> bool:
+        """Cap an in-checkpoint draft to the target's effective RoPE table."""
+        target = self.target_model_config
+        draft = self.draft_model_config
+        if target is None or draft is None or draft.model != target.model:
+            return False
+
+        target_hf = target.hf_text_config
+        draft_hf = draft.hf_text_config
+        target_max = getattr(target_hf, "max_position_embeddings", None)
+        draft_max = getattr(draft_hf, "max_position_embeddings", None)
+        if target_max is None or draft_max is None or target_max >= draft_max:
+            return False
+
+        draft_hf.max_position_embeddings = target_max
+        logger.info(
+            "Capped same-model draft max_position_embeddings from %d to %d.",
+            draft_max,
+            target_max,
+        )
+        return True
+
     def __post_init__(self):
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
@@ -955,6 +977,8 @@ class SpeculativeConfig:
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
                 )
+
+                self._cap_same_model_draft_position_embeddings()
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to
