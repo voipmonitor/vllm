@@ -253,6 +253,7 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -486,6 +487,10 @@ def _estimate_dcp_ag_rs_transient_bytes(
         + gathered_lse
         + gathered_w_uv
     )
+
+
+def _should_allocate_sparse_profile_workspace(workspace_bytes: int) -> bool:
+    return workspace_bytes > 0 and not is_vllm_cudagraph_capture_active()
 
 
 def _extract_single_layer_index(layer_name: str) -> int | None:
@@ -1146,7 +1151,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 profile_workspace_bytes = self._get_sparse_memory_profile_bytes()
-                if profile_workspace_bytes > 0:
+                # This synthetic allocation models eager runtime workspace for
+                # KV sizing. attn_metadata is also None during CUDA graph
+                # capture, where allocating it again only consumes capture-time
+                # memory and can OOM after KV cache allocation.
+                if _should_allocate_sparse_profile_workspace(profile_workspace_bytes):
                     _ = torch.empty(
                         (profile_workspace_bytes,),
                         device=k_c_normed.device,

@@ -52,6 +52,69 @@ def _pynvvideocodec_decoder_budget(api_process_count: int = 1) -> int:
     )
 
 
+def test_kernel_warmup_runs_once(monkeypatch: pytest.MonkeyPatch):
+    worker = object.__new__(Worker)
+    calls = []
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "kernel_warmup",
+        lambda warmed_worker: calls.append(warmed_worker),
+    )
+
+    worker._warmup_kernels_once()
+    worker._warmup_kernels_once()
+
+    assert calls == [worker]
+    assert worker._kernel_warmup_complete is True
+
+
+def test_failed_kernel_warmup_is_retryable(monkeypatch: pytest.MonkeyPatch):
+    worker = object.__new__(Worker)
+    calls = 0
+
+    def fail_once(_worker):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(gpu_worker_module, "kernel_warmup", fail_once)
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        worker._warmup_kernels_once()
+    worker._warmup_kernels_once()
+
+    assert calls == 2
+    assert worker._kernel_warmup_complete is True
+
+
+def test_memory_profile_replays_model_after_kernel_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = object.__new__(Worker)
+    calls = []
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda: calls.append("profile"),
+    )
+    worker.vllm_config = SimpleNamespace()
+    worker.get_model = lambda: object()
+    worker.get_kv_cache_spec = lambda: object()
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "deepseek_v4_compressor_triton_warmup",
+        lambda *args: calls.append("compressor"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_warmup_kernels_once",
+        lambda: calls.append("kernel_warmup"),
+    )
+
+    worker._profile_model_with_kernel_warmup()
+
+    assert calls == ["profile", "compressor", "kernel_warmup", "profile"]
+
+
 @pytest.mark.parametrize("video_backend", [None, "opencv"])
 def test_reserve_mm_ipc_gpu_memory_raw_frame_budget_only(
     monkeypatch: pytest.MonkeyPatch,

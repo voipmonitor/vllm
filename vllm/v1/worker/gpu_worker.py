@@ -454,6 +454,27 @@ class Worker(WorkerBase):
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
 
+    def _warmup_kernels_once(self) -> None:
+        """Materialize persistent kernel resources before KV cache sizing."""
+        if getattr(self, "_kernel_warmup_complete", False):
+            return
+        kernel_warmup(self)
+        self._kernel_warmup_complete = True
+
+    def _profile_model_with_kernel_warmup(self) -> None:
+        """Profile activations on top of persistent kernel allocations."""
+        # The first pass initializes runner state required by some warmups.
+        self.model_runner.profile_run()
+        deepseek_v4_compressor_triton_warmup(
+            self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+        )
+        self._warmup_kernels_once()
+
+        # Kernel warmup can create persistent modules and communication pools.
+        # A second pass is required so the measured peak contains both those
+        # allocations and the model's transient activation workspace.
+        self.model_runner.profile_run()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -476,6 +497,7 @@ class Worker(WorkerBase):
             deepseek_v4_compressor_triton_warmup(
                 self.get_model(), self.get_kv_cache_spec(), self.vllm_config
             )
+            self._warmup_kernels_once()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -498,10 +520,7 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
-            deepseek_v4_compressor_triton_warmup(
-                self.get_model(), self.get_kv_cache_spec(), self.vllm_config
-            )
+            self._profile_model_with_kernel_warmup()
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
@@ -797,7 +816,7 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        self._warmup_kernels_once()
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
