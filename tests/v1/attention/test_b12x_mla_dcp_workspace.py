@@ -5,11 +5,14 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     _can_use_b12x_dcp_prefill_workspace,
     _estimate_dcp_ag_rs_transient_bytes,
+    _should_allocate_sparse_profile_workspace,
 )
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.ops import common
 
@@ -446,3 +449,11 @@ def test_dcp_workspace_projection_accepts_aligned_head_capacity_pitch(monkeypatc
     assert attn_out.stride() == (kv_lora_rank, max_batched * kv_lora_rank, 1)
     assert actual.movedim(0, 1).is_contiguous()
     torch.testing.assert_close(actual, expected)
+
+
+def test_sparse_profile_workspace_skips_cudagraph_capture_scope() -> None:
+    assert _should_allocate_sparse_profile_workspace(1)
+    assert not _should_allocate_sparse_profile_workspace(0)
+    with vllm_cudagraph_capture_scope():
+        assert mla_attention.is_vllm_cudagraph_capture_active()
+        assert not _should_allocate_sparse_profile_workspace(1)
