@@ -406,6 +406,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/quantization/fused_kernels/fused_layernorm_dynamic_per_token_quant.cu"
     "csrc/libtorch_stable/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
     "csrc/libtorch_stable/attention/merge_attn_states.cu"
+    "csrc/libtorch_stable/attention/mla/safe_query_bmm.cu"
     "csrc/libtorch_stable/sampler.cu"
     "csrc/libtorch_stable/topk.cu"
     "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"
@@ -1106,6 +1107,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # Needed to use cuda/hip APIs from C-shim
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
+    find_library(VLLM_CUBLAS_LIBRARY cublas
+      PATHS "/usr/local/cuda/lib64" "/usr/local/cuda/lib" NO_DEFAULT_PATH)
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      find_library(VLLM_CUBLAS_LIBRARY cublas)
+    endif()
+    if(NOT VLLM_CUBLAS_LIBRARY)
+      message(FATAL_ERROR "safe_mla_query_bmm requires libcublas")
+    endif()
+    target_link_libraries(_C_stable_libtorch PRIVATE ${VLLM_CUBLAS_LIBRARY})
     if(COOPERATIVE_TOPK_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_COOPERATIVE_TOPK=1)

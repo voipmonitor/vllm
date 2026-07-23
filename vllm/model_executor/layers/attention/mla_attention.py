@@ -299,6 +299,35 @@ _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
 
 
+def _run_mla_query_bmm(
+    query: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    use_safe_op: bool,
+) -> None:
+    if (
+        use_safe_op
+        and query.is_cuda
+        and weight.is_cuda
+        and output.is_cuda
+        and query.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and output.dtype == torch.bfloat16
+    ):
+        try:
+            safe_bmm = torch.ops._C.safe_mla_query_bmm
+        except AttributeError:
+            safe_bmm = None
+        if safe_bmm is not None:
+            safe_bmm(query, weight, output)
+            return
+
+    # Fallback for CPU tests, non-BF16 paths, and builds without the CUDA op.
+    # The copy keeps tight DCP/custom-allocation query views out of torch.bmm.
+    torch.bmm(query.contiguous() if use_safe_op else query, weight, out=output)
+
+
 @functools.cache
 def _b12x_absorb_bmm_enabled() -> bool:
     return envs.VLLM_B12X_ABSORB_BMM
@@ -710,6 +739,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
         self.force_contiguous_mla_bmm_input = getattr(
             self.impl, "force_contiguous_mla_bmm_input", False
+        )
+        self.use_safe_mla_query_bmm = getattr(
+            self.impl, "use_safe_mla_query_bmm", False
         )
         self.force_contiguous_mla_bmm_weight = getattr(
             self.impl, "force_contiguous_mla_bmm_weight", False
@@ -1227,13 +1259,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             b_major="n",
                         )
                     else:
-                        torch.bmm(
+                        _run_mla_query_bmm(
                             mqa_q_nope,
                             self._dequant_b12x_absorbed_pair()[0],
-                            out=mqa_ql_nope,
+                            mqa_ql_nope,
+                            use_safe_op=self.use_safe_mla_query_bmm,
                         )
                 else:
-                    torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+                    _run_mla_query_bmm(
+                        mqa_q_nope,
+                        self.W_UK_T,
+                        mqa_ql_nope,
+                        use_safe_op=self.use_safe_mla_query_bmm,
+                    )
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -1749,17 +1787,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if pre_w_uv is not None:
                 pre_w_uv.copy_(w_uv)
                 w_uv = pre_w_uv
-            replace_parameter(
-                self, "W_UV", w_uv, prefer_copy=pre_w_uv is None
-            )
+            replace_parameter(self, "W_UV", w_uv, prefer_copy=pre_w_uv is None)
             # Convert from (L, N, P) to (N, P, L)
             w_uk_t = W_UK.permute(1, 2, 0)
             if pre_w_uk_t is not None:
                 pre_w_uk_t.copy_(w_uk_t)
                 w_uk_t = pre_w_uk_t
-            replace_parameter(
-                self, "W_UK_T", w_uk_t, prefer_copy=pre_w_uk_t is None
-            )
+            replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=pre_w_uk_t is None)
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]

@@ -198,6 +198,12 @@ void merge_attn_states(
     const std::optional<int64_t> prefill_tokens_with_context,
     const std::optional<torch::stable::Tensor>& output_scale = std::nullopt);
 
+// BF16 MLA query absorption BMM that avoids cuBLAS read-ahead on tight
+// DCP/custom-allocation inputs without materializing the query operand.
+void safe_mla_query_bmm(torch::stable::Tensor const& query,
+                        torch::stable::Tensor const& weight,
+                        torch::stable::Tensor& output);
+
 torch::stable::Tensor hadacore_transform(torch::stable::Tensor& x,
                                          bool inplace);
 

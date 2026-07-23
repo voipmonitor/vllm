@@ -992,15 +992,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.v_head_dim: int = mla_args.get("v_head_dim", 512)
         # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope (64) = 576.
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        # Query absorption splits Q and transposes it to head-major order,
-        # producing a non-contiguous view. Some cuBLAS BMM algorithms read a
-        # complete tile beyond that view's logical row bounds. B12X buffers can
-        # be tightly mapped, so materialize the query operand and keep the
-        # absorbed weights contiguous before entering torch.bmm.
-        #
-        # DCP attention outputs are already kept head-major for the V-up BMM;
-        # this contract is specifically for the independent query-absorb BMM.
-        self.force_contiguous_mla_bmm_input = True
+        # Query absorption sees a head-major, non-contiguous Q view. Some
+        # cuBLAS BF16 BMM kernels read past tight custom allocations, so route
+        # this BMM through the safe query op instead of materializing Q.
+        self.use_safe_mla_query_bmm = True
+        self.force_contiguous_mla_bmm_input = False
         self.force_contiguous_mla_bmm_weight = True
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose

@@ -193,7 +193,8 @@ def test_mla_init_propagates_query_bmm_contiguity_contract(monkeypatch):
         supports_mha_prefill = False
 
         def __init__(self, **kwargs):
-            self.force_contiguous_mla_bmm_input = True
+            self.use_safe_mla_query_bmm = True
+            self.force_contiguous_mla_bmm_input = False
             self.force_contiguous_mla_bmm_weight = True
 
     class FakeBackend:
@@ -220,9 +221,7 @@ def test_mla_init_propagates_query_bmm_contiguity_contract(monkeypatch):
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
     )
-    monkeypatch.setattr(
-        mla_attention_module, "get_current_vllm_config", lambda: config
-    )
+    monkeypatch.setattr(mla_attention_module, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(
         mla_attention_module, "get_current_vllm_config_or_none", lambda: config
     )
@@ -255,7 +254,8 @@ def test_mla_init_propagates_query_bmm_contiguity_contract(monkeypatch):
         use_sparse=True,
     )
 
-    assert layer.force_contiguous_mla_bmm_input
+    assert layer.use_safe_mla_query_bmm
+    assert not layer.force_contiguous_mla_bmm_input
     assert layer.force_contiguous_mla_bmm_weight
 
 
@@ -942,6 +942,82 @@ def test_mla_query_absorb_materializes_bmm_input(monkeypatch):
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
     layer.force_contiguous_mla_bmm_input = True
+    layer.use_safe_mla_query_bmm = False
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
+
+    def fake_v_up_proj(x, out):
+        out.copy_(x.reshape(out.shape))
+
+    layer._v_up_proj = fake_v_up_proj
+
+    real_bmm = torch.bmm
+    seen_input_layouts = []
+
+    def checked_bmm(input_tensor, mat2, *, out=None):
+        if mat2 is layer.W_UK_T:
+            seen_input_layouts.append(input_tensor.is_contiguous())
+        return real_bmm(input_tensor, mat2, out=out)
+
+    monkeypatch.setattr(torch, "bmm", checked_bmm)
+
+    num_tokens = 3
+    q = torch.ones((num_tokens, 2, 6), dtype=torch.bfloat16)
+    q_nope, _ = q.split((4, 2), dim=-1)
+    assert not q_nope.transpose(0, 1).is_contiguous()
+    kv_c = torch.empty((num_tokens, 3), dtype=torch.bfloat16)
+    k_pe = torch.empty((num_tokens, 1, 2), dtype=torch.bfloat16)
+    kv_cache = torch.empty((0,), dtype=torch.uint8)
+    output = torch.empty((num_tokens, 6), dtype=torch.bfloat16)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        num_decodes=num_tokens,
+        num_prefills=0,
+        num_decode_tokens=num_tokens,
+        max_query_len=1,
+    )
+
+    result = MLAAttention.forward_impl(
+        layer,
+        q,
+        kv_c,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert seen_input_layouts == [True]
+
+
+@pytest.mark.cpu_test
+def test_mla_query_absorb_safe_bmm_fallback_materializes_input(monkeypatch):
+    class FakeSparseImpl(SparseMLACommonImpl):
+        supports_quant_query_input = False
+
+        def __init__(self):
+            self.dcp_world_size = 1
+
+        def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+            assert isinstance(q, tuple)
+            return torch.ones(
+                (q[0].shape[0], q[0].shape[1], layer.kv_lora_rank),
+                dtype=q[0].dtype,
+            ), None
+
+    layer = object.__new__(MLAAttention)
+    layer.impl = FakeSparseImpl()
+    layer.kv_cache_dtype = "auto"
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 4
+    layer.qk_rope_head_dim = 2
+    layer.kv_lora_rank = 3
+    layer.v_head_dim = 3
+    layer.q_pad_num_heads = None
+    layer.force_contiguous_mla_bmm_input = False
+    layer.use_safe_mla_query_bmm = True
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
@@ -1050,6 +1126,7 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
     layer.force_contiguous_mla_bmm_input = False
+    layer.use_safe_mla_query_bmm = False
     layer.force_contiguous_mla_bmm_output = False
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
@@ -1123,6 +1200,7 @@ def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
     layer.force_contiguous_mla_bmm_input = False
+    layer.use_safe_mla_query_bmm = False
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)

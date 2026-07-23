@@ -326,6 +326,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
 
+  // BF16 MLA query absorption BMM. The implementation selects a cuBLAS
+  // compute mode that is safe for tight DCP/custom-allocation inputs.
+  ops.def(
+      "safe_mla_query_bmm(Tensor query, Tensor weight, Tensor! output) -> ()");
+
   // BF16/FP32 x FP32 -> FP32 router GEMM for H=3072, E=256, M<=32 (SM90+).
   // conditionally compiled so impl registration is in source file
   ops.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
