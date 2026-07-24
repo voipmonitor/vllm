@@ -12,11 +12,20 @@ def _require_safe_mla_query_bmm():
         pytest.skip("safe_mla_query_bmm is not built")
 
 
-@pytest.mark.parametrize("heads,tokens", [(8, 1), (8, 6), (8, 11), (11, 6), (16, 6)])
-def test_safe_mla_query_bmm_matches_torch_bmm(heads: int, tokens: int):
+@pytest.mark.parametrize(
+    "heads,tokens,q_dim",
+    [
+        (8, 1, 512),
+        (8, 6, 512),
+        (8, 11, 512),
+        (11, 6, 512),
+        (16, 6, 512),
+        (8, 8192, 192),
+    ],
+)
+def test_safe_mla_query_bmm_matches_torch_bmm(heads: int, tokens: int, q_dim: int):
     _require_safe_mla_query_bmm()
     device = torch.device("cuda")
-    q_dim = 512
     rope_dim = 64
     latent_dim = 512
     torch.manual_seed(0)

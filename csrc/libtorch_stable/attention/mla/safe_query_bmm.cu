@@ -93,7 +93,11 @@ void safe_mla_query_bmm(torch::stable::Tensor const& query,
           CUDA_R_16BF, query_ld, static_cast<long long>(query.stride(0)),
           &beta, output.mutable_data_ptr(), CUDA_R_16BF, output_ld,
           static_cast<long long>(output.stride(0)), heads,
-          CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT),
+          // The explicit operand order and leading dimensions provide the
+          // tight-query contract. Regular FP32 accumulation keeps tensor-core
+          // kernels eligible; PEDANTIC forces a much slower fallback for
+          // production prefill shapes without improving that contract.
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
       "cublasGemmStridedBatchedEx");
 }
 
