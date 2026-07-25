@@ -1202,6 +1202,35 @@ def _merge_b12x_dcp_topk(
     )
 
 
+def _get_owner_merge_dcp_group(expected_world_size: int):
+    """Return the collective group that owns the indexer's KV shards.
+
+    Partial indexer replication may use fewer KV shards than the model's
+    configured DCP size. The partial-topology extension provides a dedicated
+    selector for that case; without it, the regular DCP group remains the
+    standalone owner-merge contract.
+
+    Args:
+        expected_world_size: Number of KV shards participating in the merge.
+
+    Returns:
+        The process group whose world size matches ``expected_world_size``.
+
+    Raises:
+        RuntimeError: If the selected group does not match the indexer layout.
+    """
+    from vllm.distributed import parallel_state
+
+    selector = getattr(parallel_state, "get_indexer_dcp_group", None)
+    group = selector(expected_world_size) if selector is not None else get_dcp_group()
+    if int(group.world_size) != int(expected_world_size):
+        raise RuntimeError(
+            "DCP owner top-k group does not match the indexer KV shard count: "
+            f"group={group.world_size}, shards={expected_world_size}"
+        )
+    return group
+
+
 def _merge_b12x_dcp_topk_by_owner(
     *,
     topk_indices: torch.Tensor,
@@ -1297,7 +1326,7 @@ def _merge_b12x_dcp_topk_by_owner(
     candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
 
     _dcp_all_to_all_first_dim_into(
-        get_dcp_group(),
+        _get_owner_merge_dcp_group(dcp_world_size),
         candidates,
         received_candidates,
     )

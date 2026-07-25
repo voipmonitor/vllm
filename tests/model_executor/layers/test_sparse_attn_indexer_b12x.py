@@ -929,7 +929,29 @@ def test_b12x_dcp_owner_merge_exact_query_split_rows(monkeypatch):
         output_indices.copy_(positions.to(torch.int32))
 
     _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=dcp_size)
-    monkeypatch.setattr(indexer_mod, "get_dcp_group", lambda: FakeDCPGroup())
+
+    class ConfiguredDCPGroup:
+        world_size = tp_size
+
+        @staticmethod
+        def all_to_all_single(*args, **kwargs):
+            raise AssertionError("owner merge must use the indexer shard group")
+
+    selected_world_sizes = []
+
+    def get_indexer_dcp_group(expected_world_size):
+        selected_world_sizes.append(expected_world_size)
+        return FakeDCPGroup()
+
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_indexer_dcp_group",
+        get_indexer_dcp_group,
+        raising=False,
+    )
+    monkeypatch.setattr(indexer_mod, "get_dcp_group", lambda: ConfiguredDCPGroup())
     monkeypatch.setattr(indexer_mod, "get_tp_group", lambda: FakeTPGroup())
     monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
     workspace_manager = _FakeWorkspaceManager()
@@ -953,6 +975,7 @@ def test_b12x_dcp_owner_merge_exact_query_split_rows(monkeypatch):
     )
 
     assert used
+    assert selected_world_sizes == [dcp_size]
     assert gathered_indices.tolist() == [
         [0, 1],
         [2, 3],
@@ -1013,7 +1036,11 @@ def test_b12x_dcp_owner_merge_supports_tp_equal_dcp(monkeypatch):
         output_indices.copy_(positions.to(torch.int32))
 
     _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=dcp_size)
-    monkeypatch.setattr(indexer_mod, "get_dcp_group", lambda: FakeDCPGroup())
+    monkeypatch.setattr(
+        indexer_mod,
+        "_get_owner_merge_dcp_group",
+        lambda expected_world_size: FakeDCPGroup(),
+    )
     monkeypatch.setattr(indexer_mod, "get_tp_group", lambda: FakeTPGroup())
     monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
     monkeypatch.setattr(
