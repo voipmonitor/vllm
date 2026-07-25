@@ -135,11 +135,12 @@ def _contains_flashinfer_object(
 
 
 def _uses_flashinfer_attention(runner: "GPUModelRunner") -> bool:
+    attn_groups = getattr(runner, "attn_groups", None)
     return bool(
-        runner.attn_groups
+        attn_groups
         and any(
             _is_flashinfer_backend(group.backend)
-            for groups in runner.attn_groups
+            for groups in attn_groups
             for group in groups
         )
     )
@@ -375,15 +376,16 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
+    attn_groups = getattr(worker.model_runner, "attn_groups", None)
     if (
         not worker.model_runner.is_pooling_model
-        and worker.model_runner.attn_groups
+        and attn_groups
         # NOTE: This should be `any` instead of `all` but other hybrid attention
         # backends don't support this dummy run. Once we remove
         # `build_for_cudagraph_capture`, we can change it to `any`.
         and all(
             _is_flashinfer_backend(group.backend)
-            for groups in worker.model_runner.attn_groups
+            for groups in attn_groups
             for group in groups
         )
     ):
