@@ -1445,6 +1445,103 @@ def get_query_split_group() -> GroupCoordinator:
     return _QUERY_SPLIT
 
 
+_INDEXER_DCP: GroupCoordinator | None = None
+
+
+def get_indexer_dcp_group(
+    expected_world_size: int | None = None,
+) -> GroupCoordinator:
+    """Return the group matching an indexer's actual KV shard count.
+
+    A partially replicated target indexer and a fully sharded speculative
+    indexer can coexist in the same model. Callers that know their shard count
+    must provide it so the speculative indexer does not inherit the target's
+    smaller process group.
+    """
+    if expected_world_size is None:
+        return _INDEXER_DCP if _INDEXER_DCP is not None else get_dcp_group()
+
+    if _INDEXER_DCP is not None and int(_INDEXER_DCP.world_size) == expected_world_size:
+        return _INDEXER_DCP
+
+    dcp_group = get_dcp_group()
+    if int(dcp_group.world_size) == expected_world_size:
+        return dcp_group
+
+    partial_size = int(_INDEXER_DCP.world_size) if _INDEXER_DCP is not None else None
+    raise RuntimeError(
+        "No sparse-indexer DCP group matches the requested KV shard count: "
+        f"requested={expected_world_size}, partial={partial_size}, "
+        f"configured={dcp_group.world_size}"
+    )
+
+
+_INDEXER_QUERY_SPLIT: GroupCoordinator | None = None
+
+
+def get_indexer_query_split_group(
+    indexer_dcp_world_size: int | None = None,
+) -> GroupCoordinator:
+    """Return the query-split group paired with an indexer's shard group."""
+    if indexer_dcp_world_size is None:
+        if _INDEXER_QUERY_SPLIT is not None:
+            return _INDEXER_QUERY_SPLIT
+        return get_query_split_group()
+
+    if (
+        _INDEXER_DCP is not None
+        and int(_INDEXER_DCP.world_size) == indexer_dcp_world_size
+    ):
+        if _INDEXER_QUERY_SPLIT is None:
+            raise RuntimeError("Partial indexer DCP group has no query-split group")
+        return _INDEXER_QUERY_SPLIT
+
+    dcp_group = get_dcp_group()
+    if int(dcp_group.world_size) == indexer_dcp_world_size:
+        return get_query_split_group()
+
+    partial_size = int(_INDEXER_DCP.world_size) if _INDEXER_DCP is not None else None
+    raise RuntimeError(
+        "No indexer query-split group matches the requested KV shard count: "
+        f"requested={indexer_dcp_world_size}, partial={partial_size}, "
+        f"configured={dcp_group.world_size}"
+    )
+
+
+def _build_indexer_replica_group_ranks(
+    tp_group_ranks: list[list[int]], indexer_shards: int
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Build shard-owner groups and cross-replica query-split groups."""
+    dcp_groups: list[list[int]] = []
+    query_split_groups: list[list[int]] = []
+    for tp_ranks in tp_group_ranks:
+        if indexer_shards <= 0 or len(tp_ranks) % indexer_shards != 0:
+            raise ValueError(
+                f"Indexer shards={indexer_shards} must divide TP={len(tp_ranks)}"
+            )
+        replicas = [
+            tp_ranks[start : start + indexer_shards]
+            for start in range(0, len(tp_ranks), indexer_shards)
+        ]
+        dcp_groups.extend(replicas)
+        query_split_groups.extend(
+            [replica[shard_rank] for replica in replicas]
+            for shard_rank in range(indexer_shards)
+        )
+    return dcp_groups, query_split_groups
+
+
+def _validate_indexer_shard_count(indexer_shards: int, dcp_size: int) -> None:
+    """Reject partial-indexer layouts that cannot form equal replica groups."""
+    if indexer_shards in (0, 1, dcp_size):
+        return
+    if indexer_shards < 1 or indexer_shards > dcp_size or dcp_size % indexer_shards:
+        raise ValueError(
+            "VLLM_DCP_INDEXER_SHARDS must be 0, 1, or a positive divisor of "
+            f"the configured DCP size; got shards={indexer_shards}, DCP={dcp_size}"
+        )
+
+
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
@@ -2028,6 +2125,34 @@ def initialize_model_parallel(
             group_name="query_split",
         )
 
+    # A partially replicated sparse-indexer cache has its own shard topology.
+    # With TP8/DCP8 and four indexer shards, these are {0,1,2,3}/{4,5,6,7};
+    # ranks at the same position form two-way query-split groups.
+    global _INDEXER_DCP, _INDEXER_QUERY_SPLIT
+    assert _INDEXER_DCP is None, "indexer DCP group is already initialized"
+    assert _INDEXER_QUERY_SPLIT is None, (
+        "indexer query split group is already initialized"
+    )
+    indexer_shards = int(envs.VLLM_DCP_INDEXER_SHARDS)
+    _validate_indexer_shard_count(indexer_shards, decode_context_model_parallel_size)
+    if 1 < indexer_shards < decode_context_model_parallel_size:
+        indexer_dcp_ranks, indexer_query_split_ranks = (
+            _build_indexer_replica_group_ranks(tp_group_ranks, indexer_shards)
+        )
+        _INDEXER_DCP = init_model_parallel_group(
+            indexer_dcp_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="indexer_dcp",
+        )
+        if envs.VLLM_DCP_QUERY_SPLIT:
+            _INDEXER_QUERY_SPLIT = init_model_parallel_group(
+                indexer_query_split_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="indexer_query_split",
+            )
+
     # A dedicated communicator over the DCP ranks for the transient ckv
     # prefetch gather (Fix B). The prefetch runs on a side stream and would
     # otherwise share the DCP communicator with the indexer's DCP top-k
@@ -2272,6 +2397,16 @@ def destroy_model_parallel():
     if _QUERY_SPLIT:
         _QUERY_SPLIT.destroy()
     _QUERY_SPLIT = None
+
+    global _INDEXER_DCP
+    if _INDEXER_DCP:
+        _INDEXER_DCP.destroy()
+    _INDEXER_DCP = None
+
+    global _INDEXER_QUERY_SPLIT
+    if _INDEXER_QUERY_SPLIT:
+        _INDEXER_QUERY_SPLIT.destroy()
+    _INDEXER_QUERY_SPLIT = None
 
     global _DCP_CKV_PREFETCH
     if _DCP_CKV_PREFETCH:

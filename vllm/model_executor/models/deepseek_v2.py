@@ -617,6 +617,73 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
+def _indexer_cache_dcp_shard_count(prefix: str, vllm_config: VllmConfig) -> int:
+    parallel_config = vllm_config.parallel_config
+    dcp_size = parallel_config.decode_context_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    configured_cp_size = dcp_size * pcp_size
+    layer_id = extract_layer_index(prefix)
+    num_hidden_layers = getattr(
+        vllm_config.model_config.hf_config, "num_hidden_layers", None
+    )
+    if layer_id is None or num_hidden_layers is None:
+        return configured_cp_size
+    if configured_cp_size <= 1:
+        return configured_cp_size
+
+    if int(layer_id) >= int(num_hidden_layers):
+        return configured_cp_size
+
+    requested_shards = envs.VLLM_DCP_INDEXER_SHARDS
+    requested_replicated = envs.VLLM_DCP_REPLICATE_INDEXER_CACHE
+    if requested_replicated and requested_shards not in (0, 1):
+        raise ValueError(
+            "VLLM_DCP_REPLICATE_INDEXER_CACHE conflicts with "
+            f"VLLM_DCP_INDEXER_SHARDS={requested_shards}"
+        )
+    if requested_replicated:
+        requested_shards = 1
+    if requested_shards == 0:
+        return configured_cp_size
+
+    if not vllm_config.use_v2_model_runner:
+        raise NotImplementedError(
+            "Partially replicated sparse-indexer KV requires the V2 model runner's "
+            "per-group context-parallel block tables."
+        )
+    if not 2 <= dcp_size <= 8 or pcp_size != 1:
+        raise NotImplementedError(
+            "Partially replicated sparse-indexer KV currently supports DCP2 through "
+            "DCP8 with PCP1."
+        )
+    if (
+        requested_shards < 1
+        or requested_shards > dcp_size
+        or dcp_size % requested_shards != 0
+    ):
+        raise ValueError(
+            "VLLM_DCP_INDEXER_SHARDS must be a positive divisor of DCP, "
+            f"got shards={requested_shards}, DCP={dcp_size}."
+        )
+    if not use_b12x_sparse_indexer():
+        raise RuntimeError(
+            "Partial sparse-indexer KV replication requires the B12X sparse indexer."
+        )
+    return requested_shards
+
+
+def _replicate_indexer_cache_under_dcp(prefix: str, vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    configured_cp_size = (
+        parallel_config.decode_context_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
+    return (
+        configured_cp_size > 1
+        and _indexer_cache_dcp_shard_count(prefix, vllm_config) == 1
+    )
+
+
 class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
         self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: CacheConfig
@@ -627,30 +694,58 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        configured_cp_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        self.dcp_shard_count = _indexer_cache_dcp_shard_count(prefix, vllm_config)
+        self.dcp_replicated = configured_cp_size > 1 and self.dcp_shard_count == 1
+        self.dcp_kv_shard_count = (
+            self.dcp_shard_count
+            if 1 < self.dcp_shard_count < configured_cp_size
+            else None
+        )
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        block_size = self.cache_config.block_size
+        if self.dcp_replicated or self.dcp_kv_shard_count is not None:
+            parallel_config = vllm_config.parallel_config
+            configured_cp_size = (
+                parallel_config.decode_context_parallel_size
+                * parallel_config.prefill_context_parallel_size
+            )
+            block_size *= configured_cp_size // self.dcp_shard_count
+            logger.info_once(
+                "Using %d sparse-indexer KV shards across DCP%d with "
+                "%d-token manager pages.",
+                self.dcp_shard_count,
+                configured_cp_size,
+                block_size,
+            )
         layer_id = extract_layer_index(self.prefix)
         num_hidden_layers = getattr(
             vllm_config.model_config.hf_config, "num_hidden_layers", None
         )
         raw = envs.VLLM_DCP_SHARD_DRAFT
         shard_draft = ("1" if raw is None else raw).lower() in ("1", "true", "yes")
-        dcp_replicated = (
+        draft_replicated = (
             not shard_draft
             and layer_id is not None
             and num_hidden_layers is not None
             and int(layer_id) >= int(num_hidden_layers)
         )
         return MLAAttentionSpec(  # Only has one vector instead of K + V
-            block_size=self.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            dcp_replicated=dcp_replicated,
+            dcp_replicated=self.dcp_replicated or draft_replicated,
+            dcp_kv_shard_count=self.dcp_kv_shard_count,
         )
 
     def forward(self): ...
@@ -751,6 +846,8 @@ class Indexer(nn.Module):
             topk_scores_buffer=self.topk_scores_buffer,
             output_physical_slots=self.output_physical_slots,
             num_q_heads=self.n_head,
+            dcp_replicated=self.k_cache.dcp_replicated,
+            dcp_kv_shard_count=self.k_cache.dcp_kv_shard_count,
         )
 
         self.is_inplace_rope = is_inplace_rope
