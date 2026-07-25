@@ -80,7 +80,11 @@ def test_dcp_workspace_gate_accepts_valid_rows(num_tokens, max_num_tokens):
     )
 
 
-def _make_profile_attention(*, workspace_enabled: bool, pure_a2a: bool = False):
+def _make_profile_attention(
+    *,
+    workspace_enabled: bool,
+    pure_a2a: bool = False,
+):
     class Backend:
         @staticmethod
         def get_name():
@@ -258,9 +262,7 @@ def test_cp_lse_ag_out_rs_into_preserves_borrowed_output(monkeypatch, world_size
 
 
 def test_cp_lse_ag_out_rs_requests_head_major_output(monkeypatch):
-    corrected_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(
-        8, 3, 16
-    )
+    corrected_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(8, 3, 16)
     corrected = corrected_storage.movedim(0, 1)
     corrected_lse = torch.zeros(3, 8, dtype=torch.float32)
 
