@@ -365,11 +365,61 @@ def _dcp_all_gather_first_dim_into(
     if device_group is not None:
         import torch.distributed as dist
 
-        dist.all_gather_into_tensor(output_tensor, input_tensor, group=device_group)
+        gather_input = input_tensor
+        input_start = input_tensor.data_ptr()
+        input_end = input_start + input_tensor.numel() * input_tensor.element_size()
+        output_start = output_tensor.data_ptr()
+        output_end = output_start + output_tensor.numel() * output_tensor.element_size()
+        if input_start < output_end and output_start < input_end:
+            # PyTorch does not document NCCL's in-place alias contract. Keep
+            # its fallback portable; the deployed PyNCCL path above remains
+            # zero-copy.
+            gather_input = input_tensor.clone()
+        dist.all_gather_into_tensor(output_tensor, gather_input, group=device_group)
         return
 
     gathered = group.all_gather(input_tensor, dim=0)
     output_tensor.copy_(gathered)
+
+
+def _query_split_all_gather_indices(
+    group,
+    local_indices: torch.Tensor,
+    gathered_indices: torch.Tensor,
+) -> None:
+    """Restore query-split rows directly into their shared index buffer.
+
+    Args:
+        group: Query-split process group and rank metadata.
+        local_indices: Contiguous rank-local rows aliasing their output slot.
+        gathered_indices: Contiguous output containing every rank's rows.
+
+    Raises:
+        RuntimeError: If the buffers are noncontiguous, have incompatible
+            shapes, or do not satisfy the rank-local alias contract.
+    """
+    if group.world_size <= 1:
+        return
+    if not local_indices.is_contiguous() or not gathered_indices.is_contiguous():
+        raise RuntimeError("query-split top-k buffers must be contiguous")
+    if gathered_indices.shape[0] != local_indices.shape[0] * group.world_size:
+        raise RuntimeError("query-split output has an invalid row count")
+    if gathered_indices.shape[1:] != local_indices.shape[1:]:
+        raise RuntimeError("query-split output has an invalid trailing shape")
+
+    rank = int(group.rank_in_group)
+    expected_local = gathered_indices.narrow(
+        0, rank * local_indices.shape[0], local_indices.shape[0]
+    )
+    if expected_local.data_ptr() != local_indices.data_ptr():
+        raise RuntimeError(
+            "query-split local indices must alias their rank slot in the output"
+        )
+
+    # NCCL supports in-place all-gather when the send buffer aliases the
+    # rank-local slice of the receive buffer. The generic fallback in
+    # _dcp_all_gather_first_dim_into remains correct when PyNCCL is unavailable.
+    _dcp_all_gather_first_dim_into(group, local_indices, gathered_indices)
 
 
 def _unpack_b12x_dcp_gathered_candidates(
@@ -1525,15 +1575,12 @@ def sparse_attn_indexer(
     qs_group = None
     qs_world_size = 1
     qs_rank = 0
-    if envs.VLLM_DCP_QUERY_SPLIT and dcp_world_size > 1:
-        try:
-            _qs = get_query_split_group()
-            if int(_qs.world_size) > 1:
-                qs_group = _qs
-                qs_world_size = int(_qs.world_size)
-                qs_rank = int(_qs.rank_in_group)
-        except Exception:
-            pass
+    if envs.VLLM_DCP_QUERY_SPLIT:
+        _qs = get_query_split_group()
+        if int(_qs.world_size) > 1:
+            qs_group = _qs
+            qs_world_size = int(_qs.world_size)
+            qs_rank = int(_qs.rank_in_group)
     if output_physical_slots:
         if not _use_b12x_sparse_indexer(use_b12x_sparse_indexer):
             raise RuntimeError(
@@ -1732,19 +1779,17 @@ def sparse_attn_indexer(
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
                 if qs_active:
-                    gathered_indices = qs_group.all_gather(
-                        topk_indices.contiguous(), dim=0
-                    )
-                    topk_indices_buffer[
+                    gathered_indices = topk_indices_buffer[
                         chunk.token_start : chunk.token_end, :topk_tokens
-                    ].copy_(gathered_indices)
-                    if topk_scores is not None:
-                        gathered_scores = qs_group.all_gather(
-                            topk_scores.contiguous(), dim=0
-                        )
-                        topk_scores_buffer[
-                            chunk.token_start : chunk.token_end, :topk_tokens
-                        ].copy_(gathered_scores)
+                    ]
+                    _query_split_all_gather_indices(
+                        qs_group,
+                        topk_indices,
+                        gathered_indices,
+                    )
+                    # Scores are only needed for the DCP-local candidate merge
+                    # above. Sparse attention consumes the restored indices, so
+                    # gathering scores here would double query-split traffic.
                 continue
 
             cu_seqlen_ks = chunk.cu_seqlen_ks
