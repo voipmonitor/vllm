@@ -344,6 +344,42 @@ def _dcp_finalize_topk_remap(
     topk_indices.copy_(final.to(topk_indices.dtype))
 
 
+def _dcp_all_to_all_first_dim_into(
+    group,
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> None:
+    """Exchange equal contiguous row shards into caller-owned storage."""
+    if not input_tensor.is_contiguous() or not output_tensor.is_contiguous():
+        raise RuntimeError("DCP top-k all-to-all buffers must be contiguous")
+    if input_tensor.shape != output_tensor.shape:
+        raise RuntimeError("DCP top-k all-to-all buffers must have matching shapes")
+    if input_tensor.shape[0] % int(group.world_size) != 0:
+        raise RuntimeError("DCP top-k rows must divide the DCP world size")
+
+    # A small fake group uses this hook in unit tests. Production
+    # GroupCoordinator instances expose the NCCL process group instead.
+    all_to_all_single = getattr(group, "all_to_all_single", None)
+    if all_to_all_single is not None:
+        all_to_all_single(output_tensor, input_tensor)
+        return
+
+    device_group = getattr(group, "device_group", None)
+    if device_group is None:
+        communicator = getattr(group, "device_communicator", None)
+        device_group = getattr(communicator, "device_group", None)
+    if device_group is None:
+        raise RuntimeError("DCP group does not expose an all-to-all process group")
+
+    import torch.distributed as dist
+
+    dist.all_to_all_single(
+        output_tensor.view(-1),
+        input_tensor.view(-1),
+        group=device_group,
+    )
+
+
 def _dcp_all_gather_first_dim_into(
     group,
     input_tensor: torch.Tensor,
@@ -1154,6 +1190,201 @@ def _merge_b12x_dcp_topk(
     )
 
 
+def _get_owner_merge_dcp_group(expected_world_size: int):
+    """Return the collective group that owns the indexer's KV shards.
+
+    Partial indexer replication may use fewer KV shards than the model's
+    configured DCP size. The partial-topology extension provides a dedicated
+    selector for that case; without it, the regular DCP group remains the
+    standalone owner-merge contract.
+
+    Args:
+        expected_world_size: Number of KV shards participating in the merge.
+
+    Returns:
+        The process group whose world size matches ``expected_world_size``.
+
+    Raises:
+        RuntimeError: If the selected group does not match the indexer layout.
+    """
+    from vllm.distributed import parallel_state
+
+    selector = getattr(parallel_state, "get_indexer_dcp_group", None)
+    group = (
+        selector(expected_world_size)
+        if selector is not None
+        else parallel_state.get_dcp_group()
+    )
+    if int(group.world_size) != int(expected_world_size):
+        raise RuntimeError(
+            "DCP owner top-k group does not match the indexer KV shard count: "
+            f"group={group.world_size}, shards={expected_world_size}"
+        )
+    return group
+
+
+def _merge_b12x_dcp_topk_by_owner(
+    *,
+    topk_indices: torch.Tensor,
+    topk_scores: torch.Tensor | None,
+    gathered_topk_indices: torch.Tensor,
+    topk_tokens: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> bool:
+    """Merge each prefill row's exact candidates on one DCP rank.
+
+    Query split partitions rows across DCP groups. Within each group, an
+    all-to-all routes contiguous row shards to their owners. Every owner runs
+    the same rank-major FP32 top-k merge as the replicated path, and a final TP
+    all-gather restores rows in query-partition/owner order. ``False`` means
+    that a tail shape cannot be partitioned exactly and must use the existing
+    replicated merge.
+    """
+    if dcp_world_size <= 1 or topk_indices.numel() == 0:
+        return False
+    if topk_scores is None:
+        raise RuntimeError(
+            "B12X sparse indexer DCP requires a topk_scores_buffer for "
+            "cross-rank candidate merge."
+        )
+
+    rows = int(topk_indices.shape[0])
+    if rows % int(dcp_world_size) != 0:
+        return False
+
+    from vllm.distributed import parallel_state
+
+    tp_group = parallel_state.get_tp_group()
+    tp_world_size = int(tp_group.world_size)
+    tp_rank = int(tp_group.rank_in_group)
+    if tp_world_size % int(dcp_world_size) != 0:
+        return False
+    if tp_rank % int(dcp_world_size) != int(dcp_rank):
+        raise RuntimeError("TP and DCP rank layouts disagree for owner top-k merge")
+
+    query_partitions = tp_world_size // int(dcp_world_size)
+    expected_rows = rows * query_partitions
+    if int(gathered_topk_indices.shape[0]) != expected_rows:
+        return False
+    if gathered_topk_indices.shape[1:] != topk_indices.shape[1:]:
+        raise RuntimeError("DCP owner top-k output has an invalid trailing shape")
+
+    query_partition = tp_rank // int(dcp_world_size)
+    expected_local = gathered_topk_indices.narrow(0, query_partition * rows, rows)
+    if expected_local.data_ptr() != topk_indices.data_ptr():
+        raise RuntimeError(
+            "DCP owner top-k local rows must alias their TP query partition"
+        )
+
+    from sparkinfer.attention.nsa_indexer.tiled_topk import run_row_topk
+
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        triton_convert_dcp_local_topk_to_global,
+        triton_gather_topk_ids_by_position,
+    )
+
+    triton_convert_dcp_local_topk_to_global(
+        topk_indices,
+        topk_scores,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    )
+    if not topk_scores.is_contiguous():
+        raise RuntimeError("B12X sparse indexer DCP requires contiguous topk scores.")
+
+    owner_rows = rows // int(dcp_world_size)
+    candidate_width = int(dcp_world_size * topk_tokens)
+    (
+        candidates,
+        received_candidates,
+        candidate_indices,
+        candidate_score_bits,
+        candidate_lengths,
+        owner_values,
+        owner_positions,
+        owner_indices,
+    ) = current_workspace_manager().get_simultaneous(
+        ((rows, 2, int(topk_tokens)), torch.int32),
+        ((rows, 2, int(topk_tokens)), torch.int32),
+        ((owner_rows, candidate_width), torch.int32),
+        ((owner_rows, candidate_width), torch.int32),
+        ((owner_rows,), torch.int32),
+        ((owner_rows, int(topk_tokens)), torch.float32),
+        ((owner_rows, int(topk_tokens)), torch.int32),
+        ((owner_rows, int(topk_tokens)), torch.int32),
+    )
+    candidates[:, 0, :].copy_(topk_indices)
+    candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
+
+    _dcp_all_to_all_first_dim_into(
+        _get_owner_merge_dcp_group(dcp_world_size),
+        candidates,
+        received_candidates,
+    )
+    _unpack_b12x_dcp_gathered_candidates(
+        received_candidates,
+        candidate_indices,
+        candidate_score_bits,
+        dcp_world_size=dcp_world_size,
+        topk_tokens=int(topk_tokens),
+    )
+    candidate_lengths.fill_(candidate_width)
+    run_row_topk(
+        row_logits=candidate_score_bits.view(torch.float32),
+        lengths=candidate_lengths,
+        topk=int(topk_tokens),
+        output_values=owner_values,
+        output_indices=owner_positions,
+    )
+    triton_gather_topk_ids_by_position(
+        candidate_indices,
+        owner_positions,
+        owner_indices,
+    )
+    _dcp_all_gather_first_dim_into(
+        tp_group,
+        owner_indices,
+        gathered_topk_indices,
+    )
+    return True
+
+
+def _merge_b12x_prefill_dcp_topk(
+    *,
+    topk_indices: torch.Tensor,
+    topk_scores: torch.Tensor | None,
+    gathered_topk_indices: torch.Tensor,
+    topk_tokens: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> bool:
+    """Select the opt-in owner merge or the established replicated oracle."""
+    if envs.VLLM_DCP_TOPK_OWNER_MERGE and _merge_b12x_dcp_topk_by_owner(
+        topk_indices=topk_indices,
+        topk_scores=topk_scores,
+        gathered_topk_indices=gathered_topk_indices,
+        topk_tokens=topk_tokens,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    ):
+        return True
+
+    _merge_b12x_dcp_topk(
+        topk_indices=topk_indices,
+        topk_scores=topk_scores,
+        topk_tokens=topk_tokens,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    )
+    return False
+
+
 def _convert_b12x_dcp_local_topk_to_global(
     *,
     topk_indices: torch.Tensor,
@@ -1769,15 +2000,19 @@ def sparse_attn_indexer(
                     output_physical_slots=output_physical_slots,
                 )
                 if dcp_global_topk:
-                    _merge_b12x_dcp_topk(
+                    used_owner_merge = _merge_b12x_prefill_dcp_topk(
                         topk_indices=topk_indices,
                         topk_scores=topk_scores,
+                        gathered_topk_indices=topk_indices_buffer[
+                            chunk.token_start : chunk.token_end, :topk_tokens
+                        ],
                         topk_tokens=topk_tokens,
                         dcp_world_size=dcp_world_size,
                         dcp_rank=dcp_rank,
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
                 else:
+                    used_owner_merge = False
                     _convert_b12x_dcp_local_topk_to_global(
                         topk_indices=topk_indices,
                         topk_scores=topk_scores,
@@ -1785,6 +2020,8 @@ def sparse_attn_indexer(
                         dcp_rank=dcp_rank,
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
+                if used_owner_merge:
+                    continue
                 if qs_active:
                     gathered_indices = topk_indices_buffer[
                         chunk.token_start : chunk.token_end, :topk_tokens

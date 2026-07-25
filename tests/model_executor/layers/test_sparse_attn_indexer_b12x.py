@@ -785,6 +785,273 @@ def test_b12x_dcp_merge_passes_contiguous_scores_to_topk(monkeypatch):
     assert run_row_topk_calls == [(True, (2, 8))]
 
 
+def test_b12x_dcp_owner_merge_exact_query_split_rows(monkeypatch):
+    topk = 2
+    dcp_size = 2
+    tp_size = 4
+    tp_rank = 1
+    rows = 4
+    owner_rows = rows // dcp_size
+
+    source_ids = torch.tensor(
+        [
+            [[10, 11], [20, 21]],
+            [[12, 13], [22, 23]],
+        ],
+        dtype=torch.int32,
+    )
+    source_scores = torch.tensor(
+        [
+            [[0.10, 0.90], [0.80, 0.20]],
+            [[0.70, 0.30], [0.40, 0.60]],
+        ],
+        dtype=torch.float32,
+    )
+    received = torch.empty((dcp_size, owner_rows, 2, topk), dtype=torch.int32)
+    received[:, :, 0, :].copy_(source_ids)
+    received[:, :, 1, :].copy_(source_scores.view(torch.int32))
+
+    class FakeDCPGroup:
+        world_size = dcp_size
+
+        @staticmethod
+        def all_to_all_single(output, input_):
+            assert tuple(input_.shape) == (rows, 2, topk)
+            output.copy_(received.reshape_as(output))
+
+    class FakeTPGroup:
+        world_size = tp_size
+        rank_in_group = tp_rank
+
+        @staticmethod
+        def all_gather(input_, dim):
+            assert dim == 0
+            assert input_.tolist() == [[11, 12], [20, 23]]
+            shards = [
+                torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+                input_.clone(),
+                torch.tensor([[40, 41], [42, 43]], dtype=torch.int32),
+                torch.tensor([[60, 61], [62, 63]], dtype=torch.int32),
+            ]
+            return torch.cat(shards, dim=0)
+
+    def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
+        assert lengths.tolist() == [4, 4]
+        values, positions = torch.topk(row_logits, k=topk, dim=1)
+        output_values.copy_(values)
+        output_indices.copy_(positions.to(torch.int32))
+
+    _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=dcp_size)
+
+    class ConfiguredDCPGroup:
+        world_size = tp_size
+
+        @staticmethod
+        def all_to_all_single(*args, **kwargs):
+            raise AssertionError("owner merge must use the indexer shard group")
+
+    selected_world_sizes = []
+
+    def get_indexer_dcp_group(expected_world_size):
+        selected_world_sizes.append(expected_world_size)
+        return FakeDCPGroup()
+
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_indexer_dcp_group",
+        get_indexer_dcp_group,
+        raising=False,
+    )
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: ConfiguredDCPGroup())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: FakeTPGroup())
+    monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
+    workspace_manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        indexer_mod, "current_workspace_manager", lambda: workspace_manager
+    )
+
+    gathered_indices = torch.full((8, topk), -1, dtype=torch.int32)
+    local_indices = gathered_indices[:rows]
+    local_indices.copy_(torch.arange(rows * topk, dtype=torch.int32).view(rows, topk))
+    local_scores = torch.zeros((rows, topk), dtype=torch.float32)
+
+    used = indexer_mod._merge_b12x_dcp_topk_by_owner(
+        topk_indices=local_indices,
+        topk_scores=local_scores,
+        gathered_topk_indices=gathered_indices,
+        topk_tokens=topk,
+        dcp_world_size=dcp_size,
+        dcp_rank=1,
+        cp_kv_cache_interleave_size=16,
+    )
+
+    assert used
+    assert selected_world_sizes == [dcp_size]
+    assert gathered_indices.tolist() == [
+        [0, 1],
+        [2, 3],
+        [11, 12],
+        [20, 23],
+        [40, 41],
+        [42, 43],
+        [60, 61],
+        [62, 63],
+    ]
+    assert workspace_manager.specs == (
+        ((4, 2, 2), torch.int32),
+        ((4, 2, 2), torch.int32),
+        ((2, 4), torch.int32),
+        ((2, 4), torch.int32),
+        ((2,), torch.int32),
+        ((2, 2), torch.float32),
+        ((2, 2), torch.int32),
+        ((2, 2), torch.int32),
+    )
+
+
+def test_b12x_dcp_owner_merge_supports_tp_equal_dcp(monkeypatch):
+    topk = 2
+    dcp_size = 4
+    rows = 4
+    received_ids = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+    received_scores = torch.tensor([0.1, 0.9, 0.7, 0.3], dtype=torch.float32)
+
+    class FakeDCPGroup:
+        world_size = dcp_size
+
+        @staticmethod
+        def all_to_all_single(output, input_):
+            output_view = output.view(dcp_size, 1, 2, topk)
+            output_view[:, 0, 0, 0].copy_(received_ids)
+            output_view[:, 0, 0, 1].fill_(-1)
+            output_view[:, 0, 1, 0].copy_(received_scores.view(torch.int32))
+            output_view[:, 0, 1, 1].fill_(
+                torch.tensor(-float("inf"), dtype=torch.float32).view(torch.int32)
+            )
+
+    class FakeTPGroup:
+        world_size = dcp_size
+        rank_in_group = 2
+
+        @staticmethod
+        def all_gather(input_, dim):
+            assert dim == 0
+            assert input_.tolist() == [[20, 30]]
+            return torch.tensor(
+                [[0, 1], [10, 11], [20, 30], [40, 41]], dtype=torch.int32
+            )
+
+    def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
+        values, positions = torch.topk(row_logits, k=topk, dim=1)
+        output_values.copy_(values)
+        output_indices.copy_(positions.to(torch.int32))
+
+    _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=dcp_size)
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        indexer_mod,
+        "_get_owner_merge_dcp_group",
+        lambda expected_world_size: FakeDCPGroup(),
+    )
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: FakeTPGroup())
+    monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
+    monkeypatch.setattr(
+        indexer_mod,
+        "current_workspace_manager",
+        lambda: _FakeWorkspaceManager(),
+    )
+
+    indices = torch.arange(rows * topk, dtype=torch.int32).view(rows, topk)
+    scores = torch.zeros((rows, topk), dtype=torch.float32)
+    used = indexer_mod._merge_b12x_dcp_topk_by_owner(
+        topk_indices=indices,
+        topk_scores=scores,
+        gathered_topk_indices=indices,
+        topk_tokens=topk,
+        dcp_world_size=dcp_size,
+        dcp_rank=2,
+        cp_kv_cache_interleave_size=16,
+    )
+
+    assert used
+    assert indices.tolist() == [[0, 1], [10, 11], [20, 30], [40, 41]]
+
+
+def test_b12x_dcp_owner_merge_falls_back_for_tail(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: pytest.fail("tail fallback must not initialize a TP collective"),
+    )
+    topk_indices = torch.zeros((3, 2), dtype=torch.int32)
+    topk_scores = torch.zeros((3, 2), dtype=torch.float32)
+
+    assert not indexer_mod._merge_b12x_dcp_topk_by_owner(
+        topk_indices=topk_indices,
+        topk_scores=topk_scores,
+        gathered_topk_indices=torch.empty((6, 2), dtype=torch.int32),
+        topk_tokens=2,
+        dcp_world_size=2,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=16,
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "owner_result", "expected_owner_calls", "expected_oracle_calls"),
+    [
+        (False, True, 0, 1),
+        (True, False, 1, 1),
+        (True, True, 1, 0),
+    ],
+)
+def test_b12x_prefill_dcp_topk_routes_owner_or_oracle(
+    monkeypatch,
+    enabled,
+    owner_result,
+    expected_owner_calls,
+    expected_oracle_calls,
+):
+    owner_calls = []
+    oracle_calls = []
+
+    def fake_owner(**kwargs):
+        owner_calls.append(kwargs)
+        return owner_result
+
+    def fake_oracle(**kwargs):
+        oracle_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        indexer_mod.envs,
+        "VLLM_DCP_TOPK_OWNER_MERGE",
+        enabled,
+    )
+    monkeypatch.setattr(indexer_mod, "_merge_b12x_dcp_topk_by_owner", fake_owner)
+    monkeypatch.setattr(indexer_mod, "_merge_b12x_dcp_topk", fake_oracle)
+
+    indices = torch.empty((4, 2), dtype=torch.int32)
+    scores = torch.empty((4, 2), dtype=torch.float32)
+    used = indexer_mod._merge_b12x_prefill_dcp_topk(
+        topk_indices=indices,
+        topk_scores=scores,
+        gathered_topk_indices=indices,
+        topk_tokens=2,
+        dcp_world_size=2,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=16,
+    )
+
+    assert used is (enabled and owner_result)
+    assert len(owner_calls) == expected_owner_calls
+    assert len(oracle_calls) == expected_oracle_calls
+
+
 def test_b12x_dcp_merge_warmup_reserves_workspace(monkeypatch):
     def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
         positions = torch.arange(topk, dtype=output_indices.dtype).expand_as(

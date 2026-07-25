@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_DCP_TOPK_OWNER_MERGE: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1169,6 +1170,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCP_QUERY_SPLIT": lambda: (
         os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    # Send each query row's exact FP32 top-k candidates to one DCP owner, merge
+    # once there, then gather only the final indices over TP. This is an
+    # opt-in prefill path until the full TP/DCP validation matrix is complete.
+    "VLLM_DCP_TOPK_OWNER_MERGE": lambda: (
+        os.getenv("VLLM_DCP_TOPK_OWNER_MERGE", "0").lower()
+        in ("1", "true", "yes", "on")
     ),
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
