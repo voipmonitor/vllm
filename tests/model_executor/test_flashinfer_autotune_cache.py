@@ -91,7 +91,10 @@ def _flashinfer_autotune_worker(model, *, attn_groups=None):
                 cudagraph_capture_sizes=[],
                 compile_sizes=[],
             ),
-            kernel_config=SimpleNamespace(enable_flashinfer_autotune=True),
+            kernel_config=SimpleNamespace(
+                enable_flashinfer_autotune=True,
+                enable_cutedsl_warmup=False,
+            ),
         ),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
     )
@@ -149,6 +152,8 @@ def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
     )
     worker = SimpleNamespace(
         get_model=lambda: model,
+        use_v2_model_runner=True,
+        model_runner=SimpleNamespace(is_pooling_model=True),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
         vllm_config=SimpleNamespace(
@@ -157,6 +162,7 @@ def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
                 dcp_comm_backend="a2a",
             ),
             compilation_config=compilation_config,
+            model_config=SimpleNamespace(),
         ),
     )
     group = object()
@@ -265,6 +271,12 @@ def test_kernel_warmup_limits_fused_mla_query_to_graph_sizes(monkeypatch) -> Non
     kernel_warmup.kernel_warmup(worker)
 
     assert calls == [((model,), {"m_values": [1, 2, 4, 32]})]
+
+
+def test_flashinfer_attention_gate_accepts_pre_kv_runner() -> None:
+    runner = SimpleNamespace()
+
+    assert kernel_warmup._uses_flashinfer_attention(runner) is False
 
 
 def test_kernel_warmup_runs_b12x_moe_warmup(monkeypatch) -> None:
