@@ -741,7 +741,25 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         _pending_fp8_linear: dict = {}
+        # Normalize rank-sliced checkpoint names the same way
+        # DeepseekV2ForCausalLM.load_weights does. Quant configs that serialize
+        # per-TP-rank payloads (EXL3 rank-sliced trellis) expose
+        # normalize_rank_sliced_weight_name(); without applying it here the MTP
+        # layer's per-expert `.rank{r}.{suffix}` tensors never map onto the fused
+        # RoutedExperts parameters and loading dies with e.g.
+        # KeyError: '...mtp_block.mlp.experts.routed_experts.w2_rank0.mcg'.
+        # No-op (getattr -> None) for quant configs without rank slicing.
+        quant_config = getattr(self, "quant_config", None)
+        rank_sliced_name = (
+            getattr(quant_config, "normalize_rank_sliced_weight_name", None)
+            if quant_config is not None
+            else None
+        )
         for name, loaded_weight in weights:
+            if rank_sliced_name is not None:
+                name = rank_sliced_name(name)
+                if name is None:
+                    continue
             if "rotary_emb.inv_freq" in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
