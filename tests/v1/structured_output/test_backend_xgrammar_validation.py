@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from unittest.mock import Mock
+
+from vllm.v1.structured_output.backend_xgrammar import XgrammarGrammar
+
+
+class _TerminatingMatcher:
+    """Matcher stub that rejects calls after its terminating token."""
+
+    def __init__(self, terminating_token: int):
+        self.terminating_token = terminating_token
+        self.accepted_tokens: list[int] = []
+        self.terminated = False
+        self.rollback_count = 0
+
+    def accept_token(self, token: int) -> bool:
+        assert not self.terminated, "matcher called after grammar termination"
+        self.accepted_tokens.append(token)
+        self.terminated = token == self.terminating_token
+        return True
+
+    def is_terminated(self) -> bool:
+        return self.terminated
+
+    def rollback(self, num_tokens: int) -> None:
+        self.rollback_count = num_tokens
+        self.terminated = False
+
+
+def test_validate_tokens_stops_at_grammar_termination():
+    """Speculative validation trims every token after the stop token."""
+    matcher = _TerminatingMatcher(terminating_token=2)
+    grammar = XgrammarGrammar(vocab_size=8, matcher=matcher, ctx=Mock())
+
+    accepted = grammar.validate_tokens([1, 2, 3, 4])
+
+    assert accepted == [1, 2]
+    assert matcher.accepted_tokens == [1, 2]
+    assert matcher.rollback_count == 2
+    assert not matcher.is_terminated()
+
+
+def test_validate_tokens_skips_an_already_terminated_grammar():
+    """A committed terminal grammar has no valid speculative suffix."""
+    matcher = _TerminatingMatcher(terminating_token=2)
+    grammar = XgrammarGrammar(
+        vocab_size=8,
+        matcher=matcher,
+        ctx=Mock(),
+        _is_terminated=True,
+    )
+
+    assert grammar.validate_tokens([1, 2]) == []
+    assert matcher.accepted_tokens == []
