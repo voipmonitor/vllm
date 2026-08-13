@@ -103,6 +103,9 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
     get_uniform_token_count,
 )
+from vllm.v1.worker.gpu.distribution_capture import (
+    capture_pre_lm_head_prompt_hidden_states,
+)
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -2096,6 +2099,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Last rank: sample tokens
+        assert hidden_states is not None
+        capture_pre_lm_head_prompt_hidden_states(
+            self.model,
+            hidden_states,
+            input_batch,
+            self.req_states.prompt_len.np,
+        )
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
         )

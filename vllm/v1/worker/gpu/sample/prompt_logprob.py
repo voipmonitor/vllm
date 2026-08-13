@@ -165,7 +165,6 @@ class PromptLogprobsWorker:
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
         is_prompt_chunked = pos_after_step < prompt_lens
         query_start_loc_np = input_batch.query_start_loc_np
-
         logits_capture: Callable[[torch.Tensor, int], None] | None = None
         if _should_capture_kld_batch(input_batch.req_ids):
             if len(input_batch.req_ids) != 1 or int(needs_prompt_logprobs.sum()) != 1:
@@ -334,7 +333,7 @@ def compute_prompt_logprobs_with_chunking(
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
     for start_idx in range(0, prompt_token_ids.shape[0], chunk_size):
-        end_idx = start_idx + chunk_size
+        end_idx = min(start_idx + chunk_size, prompt_token_ids.shape[0])
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
         if logits_capture is not None:

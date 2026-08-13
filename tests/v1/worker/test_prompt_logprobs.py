@@ -78,6 +78,118 @@ def test_prompt_logprobs_chunk_size_bounds_logits_rows_and_preserves_mode(
     torch.testing.assert_close(ranks, torch.ones(5, dtype=torch.int64))
 
 
+def test_prompt_logprobs_reports_exact_chunk_ranges_to_callback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: list[tuple[int, int, torch.Tensor]] = []
+
+    def logits_fn(hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states[:, :2].clone()
+
+    def fake_compute_topk_scores(
+        logits: torch.Tensor,
+        num_logprobs: int,
+        sampled_token_ids: torch.Tensor,
+        *,
+        logits_mode: bool,
+    ) -> SimpleNamespace:
+        del num_logprobs, logits_mode
+        return SimpleNamespace(
+            logprob_token_ids=sampled_token_ids.unsqueeze(-1),
+            logprobs=torch.zeros((logits.shape[0], 1)),
+            selected_token_ranks=torch.ones(logits.shape[0], dtype=torch.int64),
+        )
+
+    monkeypatch.setattr(prompt_logprob, "compute_topk_scores", fake_compute_topk_scores)
+    hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    compute_prompt_logprobs_with_chunking(
+        torch.arange(5),
+        hidden_states,
+        logits_fn,
+        num_prompt_logprobs=1,
+        chunk_size=2,
+        logits_callback=lambda logits, start, end: captured.append(
+            (start, end, logits.clone())
+        ),
+    )
+
+    assert [(start, end) for start, end, _ in captured] == [(0, 2), (2, 4), (4, 5)]
+    torch.testing.assert_close(
+        torch.cat([logits for _, _, logits in captured]), hidden_states[:, :2]
+    )
+
+
+def test_prompt_logprobs_live_capture_uses_context_row_offsets(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = PromptLogprobsWorker(max_num_reqs=1)
+    worker.uses_prompt_logprobs[0] = True
+    worker.num_prompt_logprobs[0] = 1
+    worker.in_progress_prompt_logprobs["req"] = None
+    captured: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(
+        prompt_logprob, "live_prompt_logit_capture_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        prompt_logprob,
+        "capture_live_prompt_logits",
+        lambda logits, *, req_id, row_start: captured.append(
+            (req_id, row_start, logits.shape[0])
+        ),
+    )
+    monkeypatch.setattr(
+        prompt_logprob,
+        "get_prompt_logprobs_token_ids",
+        lambda *args, **kwargs: torch.arange(args[0]),
+    )
+
+    def fake_compute(*args, **kwargs):
+        rows = args[0].shape[0]
+        logits = torch.zeros((rows, 8), dtype=torch.bfloat16)
+        kwargs["logits_callback"](logits, 0, rows)
+        return (
+            torch.zeros((rows, 2), dtype=torch.int64),
+            torch.zeros((rows, 2)),
+            torch.zeros(rows, dtype=torch.int64),
+        )
+
+    monkeypatch.setattr(
+        prompt_logprob, "compute_prompt_logprobs_with_chunking", fake_compute
+    )
+
+    def make_batch(computed: int, scheduled: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            idx_mapping_np=np.array([0]),
+            idx_mapping=torch.tensor([0]),
+            num_computed_prefill_tokens_np=np.array([computed]),
+            prefill_len_np=np.array([5]),
+            num_scheduled_tokens=np.array([scheduled]),
+            num_tokens=scheduled,
+            query_start_loc=torch.tensor([0, scheduled]),
+            query_start_loc_np=np.array([0, scheduled]),
+            req_ids=["req"],
+        )
+
+    worker.compute_prompt_logprobs(
+        Mock(),
+        torch.zeros((2, 4)),
+        make_batch(computed=0, scheduled=2),
+        torch.zeros((1, 5), dtype=torch.int64),
+        torch.zeros(1, dtype=torch.int64),
+        np.array([5]),
+    )
+    worker.compute_prompt_logprobs(
+        Mock(),
+        torch.zeros((3, 4)),
+        make_batch(computed=2, scheduled=3),
+        torch.zeros((1, 5), dtype=torch.int64),
+        torch.full((1,), 2, dtype=torch.int64),
+        np.array([5]),
+    )
+
+    assert captured == [("req", 0, 2), ("req", 2, 2)]
+
+
 def test_prompt_logprobs_profile_uses_full_batch(
     monkeypatch: pytest.MonkeyPatch,
 ):
