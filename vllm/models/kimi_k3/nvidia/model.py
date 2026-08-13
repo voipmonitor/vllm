@@ -1960,8 +1960,15 @@ class KimiLinearForCausalLM(
     ) -> torch.Tensor | None:
         # The model's final norm is applied here (not at the end of forward) so
         # that the pre-norm hidden states can be fed to the MTP draft model.
-        hidden_states = self.model.norm(hidden_states, None)
+        hidden_states = self.compute_pre_lm_head_hidden_states(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def compute_pre_lm_head_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the final normalization that immediately precedes the LM head."""
+        return self.model.norm(hidden_states, None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
@@ -2412,6 +2419,13 @@ class KimiK3ForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
+
+    def compute_pre_lm_head_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return final normalized language-model states before the LM head."""
+        return self.language_model.compute_pre_lm_head_hidden_states(hidden_states)
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.language_model.mamba_cache.copy_inputs_before_cuda_graphs(

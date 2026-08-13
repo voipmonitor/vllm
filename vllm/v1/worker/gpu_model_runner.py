@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -4641,6 +4643,10 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                self._capture_pre_lm_head_prompt_hidden_states(
+                    hidden_states,
+                    scheduler_output,
+                )
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
@@ -5862,6 +5868,11 @@ class GPUModelRunner(
                 chunk_logits = self.model.compute_logits(
                     prompt_hidden_states[chunk_start:chunk_end]
                 )
+                self._capture_live_prompt_logits(
+                    chunk_logits,
+                    req_id=req_id,
+                    row_start=start_idx + chunk_start,
+                )
                 chunk_tgt = tgt_token_ids[chunk_start:chunk_end]
                 scores = (
                     chunk_logits.to(torch.float32)
@@ -5894,6 +5905,147 @@ class GPUModelRunner(
             self._sync_device()
 
         return prompt_logprobs_dict
+
+    def _capture_live_prompt_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        req_id: str,
+        row_start: int,
+    ) -> None:
+        """Persist native prompt logits for hidden-state replay qualification."""
+        capture_dir = os.environ.get("VLLM_KLD_LIVE_LOGIT_CAPTURE_DIR")
+        if not capture_dir or not is_global_first_rank():
+            return
+        if logits.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "Live KLD capture requires native BF16 logits; got "
+                f"{logits.dtype} for request {req_id}"
+            )
+
+        row_end = row_start + logits.shape[0]
+        safe_req_id = "".join(
+            char if char.isalnum() or char in "-_." else "_" for char in req_id
+        )
+        request_dir = Path(capture_dir) / safe_req_id
+        request_dir.mkdir(parents=True, exist_ok=True)
+        output_path = request_dir / (
+            f"logits.rows-{row_start:06d}-{row_end:06d}.safetensors"
+        )
+        if output_path.exists():
+            raise RuntimeError(f"Refusing to overwrite live KLD chunk: {output_path}")
+
+        logits_cpu = (
+            logits[:, : self.input_batch.vocab_size]
+            .detach()
+            .to(device="cpu")
+            .contiguous()
+        )
+        from safetensors.torch import save_file
+
+        temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+        save_file(
+            {"logits": logits_cpu},
+            str(temporary_path),
+            metadata={
+                "request_id": req_id,
+                "row_start": str(row_start),
+                "row_end": str(row_end),
+                "semantic_point": "live_lm_head_output_before_sampling",
+                "vocab_size": str(self.input_batch.vocab_size),
+            },
+        )
+        os.replace(temporary_path, output_path)
+        logger.info(
+            "Saved live prompt-logit rows [%d, %d) shape=%s to %s",
+            row_start,
+            row_end,
+            tuple(logits_cpu.shape),
+            output_path,
+        )
+
+    def _capture_pre_lm_head_prompt_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Persist final-normalized prompt states for offline logit replay."""
+        capture_dir = os.environ.get("VLLM_KLD_HIDDEN_CAPTURE_DIR")
+        if not capture_dir or not is_global_first_rank():
+            return
+
+        model = self.get_model()
+        normalize = getattr(model, "compute_pre_lm_head_hidden_states", None)
+        if normalize is None:
+            raise RuntimeError(
+                "VLLM_KLD_HIDDEN_CAPTURE_DIR requires a model that exposes "
+                "compute_pre_lm_head_hidden_states"
+            )
+
+        for req_id in self.input_batch.req_ids:
+            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id)
+            if num_tokens is None or num_tokens <= 0:
+                continue
+
+            request = self.requests[req_id]
+            if request.prompt_token_ids is None:
+                raise RuntimeError(
+                    "Pre-LM-head capture requires prompt token IDs; prompt "
+                    f"embeddings are unsupported for request {req_id}"
+                )
+
+            row_start = request.num_computed_tokens
+            prompt_rows = len(request.prompt_token_ids)
+            row_end = min(row_start + num_tokens, prompt_rows)
+            if row_start >= row_end:
+                continue
+
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            offset = int(self.query_start_loc.np[req_idx])
+            row_count = row_end - row_start
+            request_hidden_states = hidden_states[offset : offset + row_count]
+            normalized = normalize(request_hidden_states)
+            if normalized.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "Pre-LM-head capture requires native BF16 states; got "
+                    f"{normalized.dtype} for request {req_id}"
+                )
+
+            safe_req_id = "".join(
+                char if char.isalnum() or char in "-_." else "_" for char in req_id
+            )
+            request_dir = Path(capture_dir) / safe_req_id
+            request_dir.mkdir(parents=True, exist_ok=True)
+            output_path = request_dir / (
+                f"hidden.rows-{row_start:06d}-{row_end:06d}.safetensors"
+            )
+            if output_path.exists():
+                raise RuntimeError(
+                    f"Refusing to overwrite pre-LM-head capture chunk: {output_path}"
+                )
+
+            normalized_cpu = normalized.detach().to(device="cpu").contiguous()
+            from safetensors.torch import save_file
+
+            temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+            save_file(
+                {"hidden_states": normalized_cpu},
+                str(temporary_path),
+                metadata={
+                    "request_id": req_id,
+                    "row_start": str(row_start),
+                    "row_end": str(row_end),
+                    "semantic_point": "after_final_rmsnorm_before_lm_head",
+                },
+            )
+            os.replace(temporary_path, output_path)
+            logger.info(
+                "Saved pre-LM-head rows [%d, %d) shape=%s to %s",
+                row_start,
+                row_end,
+                tuple(normalized_cpu.shape),
+                output_path,
+            )
 
     def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
         """Count NaNs per request, reading the result back to the host.
