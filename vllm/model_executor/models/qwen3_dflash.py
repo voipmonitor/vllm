@@ -94,6 +94,12 @@ def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
     Draft checkpoints do not encode this property. A mismatch changes every
     drafted attention result without raising an error and collapses token
     acceptance.
+
+    Args:
+        target_model: Target model that can expose rotary layout modules.
+
+    Returns:
+        The exposed NeoX rotary-layout setting, or ``None`` when unavailable.
     """
     language_model = (
         target_model.get_language_model()
