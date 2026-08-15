@@ -562,6 +562,7 @@ def test_external_mamba_hit_same_block_uses_running_cow_on_continue():
     request.num_computed_tokens = 10
     first_step_blocks = manager.allocate_slots(request, num_new_tokens=4)
     assert first_step_blocks is not None
+    assert first_step_blocks.get_block_ids()[1] == []
 
     source_block_id = manager.get_blocks("0").get_block_ids()[1][1]
     partial_hash = request.block_hashes[14 // hash_block_size - 1]
