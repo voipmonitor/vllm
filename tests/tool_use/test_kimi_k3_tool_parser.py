@@ -385,8 +385,15 @@ def test_streaming_emits_argument_text_as_it_arrives():
     previous_text = ""
     previous_ids: list[int] = []
     messages: list[DeltaMessage] = []
+    arguments_before_close = ""
 
     for i, chunk in enumerate(chunks, start=1):
+        if chunk == f"{CLOSE}argument{SEP}":
+            arguments_before_close = "".join(
+                tool_call.function.arguments or ""
+                for message in messages
+                for tool_call in (message.tool_calls or [])
+            )
         current_text = previous_text + chunk
         current_ids = previous_ids + [i]
         delta = parser.extract_tool_calls_streaming(
@@ -413,11 +420,63 @@ def test_streaming_emits_argument_text_as_it_arrives():
     ]
     assert len(tool_deltas) >= len(body_chunks)
     assert all(tool_call.index == 0 for tool_call in tool_deltas)
+    assert (
+        arguments_before_close
+        == json.dumps({"content": value}, ensure_ascii=False)[:-2]
+    )
 
     arguments = "".join(tool_call.function.arguments or "" for tool_call in tool_deltas)
     assert json.loads(arguments) == {"content": value}
     non_streamed = parser.extract_tool_calls(previous_text, request)
     assert arguments == non_streamed.tool_calls[0].function.arguments
+
+
+def test_streaming_holds_whitespace_tolerant_argument_close_fragments():
+    parser = KimiK3ToolParser(DummyTokenizer())
+    request = _request()
+    chunks = [
+        f"{OPEN}tools{SEP}",
+        f'{OPEN}call tool="write_file" index="1"{SEP}',
+        f'{OPEN}argument key="content" type="string"{SEP}',
+        "payload",
+        f"{CLOSE} arg",
+        "ument ",
+        "<|sep",
+        "|>",
+        f"{CLOSE}call{SEP}",
+    ]
+    previous_text = ""
+    previous_ids: list[int] = []
+    streamed_arguments = ""
+    partial_close_snapshots: list[str] = []
+
+    for i, chunk in enumerate(chunks, start=1):
+        current_text = previous_text + chunk
+        current_ids = previous_ids + [i]
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=chunk,
+            previous_token_ids=previous_ids,
+            current_token_ids=current_ids,
+            delta_token_ids=[i],
+            request=request,
+        )
+        if delta is not None:
+            streamed_arguments += "".join(
+                tool_call.function.arguments or ""
+                for tool_call in (delta.tool_calls or [])
+            )
+        if 5 <= i <= 7:
+            partial_close_snapshots.append(streamed_arguments)
+        previous_text = current_text
+        previous_ids = current_ids
+
+    expected_prefix = json.dumps({"content": "payload"}, ensure_ascii=False)[:-2]
+    assert partial_close_snapshots == [expected_prefix] * 3
+    assert json.loads(streamed_arguments) == {"content": "payload"}
+    non_streamed = parser.extract_tool_calls(previous_text, request)
+    assert streamed_arguments == non_streamed.tool_calls[0].function.arguments
 
 
 def test_tool_call_ids_are_unique_across_messages():
