@@ -70,6 +70,25 @@ def _partial_tag_overlap(text: str, tag: str) -> int:
     return 0
 
 
+def _partial_pattern_overlap(text: str, pattern: re.Pattern) -> int:
+    """Return a trailing prefix accepted by a partial regular expression.
+
+    Args:
+        text: Generated text that may end inside a structural marker.
+        pattern: Complete structural-marker expression.
+
+    Returns:
+        The number of trailing characters that form an incomplete match.
+    """
+    candidate = text.rfind("<")
+    while candidate >= 0:
+        match = pattern.fullmatch(text[candidate:], partial=True)
+        if match is not None and match.partial:
+            return len(text) - candidate
+        candidate = text.rfind("<", 0, candidate)
+    return 0
+
+
 class KimiK3ToolParser(ToolParser):
     supports_required_and_named = False
     # Enables the vLLM-side XTML structural tag builder
@@ -138,6 +157,7 @@ class KimiK3ToolParser(ToolParser):
         self._arg_open_re = re.compile(
             _O + r"\s*argument\s+(?P<attrs>" + _TEXT_UNTIL_SEP + r")" + _S
         )
+        self._arg_close_re = re.compile(_C + r"\s*argument\s*" + _S)
         # attr segment: key="value" (value already escaped on the encode side)
         self._attr_re = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
         self._response_re = re.compile(
@@ -259,12 +279,13 @@ class KimiK3ToolParser(ToolParser):
     def _partial_arguments(self, body: str) -> str:
         """Serialize the arguments of a ``call`` block that has not closed yet.
 
-        The result is always a prefix of what the finished call serializes to,
-        so the caller can stream the difference against what it already sent.
-        String values are emitted raw by the template, so their text is
-        forwarded as it arrives (minus a trailing partial close marker); other
-        types need the whole literal to decode and are held until their block
-        closes.
+        Args:
+            body: The incomplete XTML call body.
+
+        Returns:
+            A prefix of the completed call's JSON arguments. String values can
+            stream as generated. Other argument types remain buffered until
+            their complete JSON literal is available.
         """
         closed_end = 0
         for arg_match in self._arg_re.finditer(body):
@@ -280,7 +301,7 @@ class KimiK3ToolParser(ToolParser):
         if arg_attrs.get("type", "string") != "string":
             return json.dumps(arguments, ensure_ascii=False)[:-1]
         raw_value = body[m_open.end() :]
-        held = _partial_tag_overlap(raw_value, self.argument_close)
+        held = _partial_pattern_overlap(raw_value, self._arg_close_re)
         arguments[arg_attrs.get("key", "")] = raw_value[: len(raw_value) - held]
         # drop the closing quote of the open value and the "}" of the object
         return json.dumps(arguments, ensure_ascii=False)[:-2]
