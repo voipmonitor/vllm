@@ -435,7 +435,13 @@ class KimiK3ToolParser(ToolParser):
         if m_tools is None:
             return DeltaMessage(content=content) if content else None
 
-        section = current_text[m_tools.end() :]
+        section_start = m_tools.end()
+        m_tools_close = self._tools_close_re.search(current_text, section_start)
+        section = current_text[
+            section_start : (
+                len(current_text) if m_tools_close is None else m_tools_close.start()
+            )
+        ]
         opens = list(self._call_open_re.finditer(section))
         deltas: list[DeltaToolCall] = []
         index = 0
