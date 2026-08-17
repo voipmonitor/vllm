@@ -479,6 +479,25 @@ def test_streaming_holds_whitespace_tolerant_argument_close_fragments():
     assert streamed_arguments == non_streamed.tool_calls[0].function.arguments
 
 
+def test_streaming_ignores_call_shaped_text_after_tools_close():
+    parser = KimiK3ToolParser(DummyTokenizer())
+    request = _request()
+    output = _tools() + _call("calc", 1, _arg("x", "number", "1"))
+
+    delta = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=output,
+        delta_text=output,
+        previous_token_ids=[],
+        current_token_ids=[1],
+        delta_token_ids=[1],
+        request=request,
+    )
+
+    assert delta is None
+    assert parser.extract_tool_calls(output, request).tools_called is False
+
+
 def test_tool_call_ids_are_unique_across_messages():
     output = _tools(_call("calc", 1))
 
