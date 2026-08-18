@@ -17,6 +17,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+    NixlBaseConnector,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -563,6 +566,108 @@ def test_sync_recompute_handles_invalid_block_in_second_kv_cache_group():
     assert request.num_computed_tokens == invalid_block_idx * block_size
     assert request in scheduler.running
     assert request.request_id in scheduler.requests
+
+
+def test_sync_fail_handles_invalid_block_in_seventeenth_kv_cache_group():
+    """A hybrid-cache load failure must fail one request, not the scheduler."""
+    block_size = 16
+    num_blocks = 512
+    num_prompt_blocks = 8
+    num_external_computed_blocks = 7
+    invalid_block_idx = 3
+    num_kv_cache_groups = 17
+
+    vllm_config = create_vllm_config(
+        block_size=block_size,
+        kv_load_failure_policy="fail",
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            *[
+                KVCacheGroupSpec(
+                    [f"full_attention_layer_{group_idx}"],
+                    FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                )
+                for group_idx in range(num_kv_cache_groups - 1)
+            ],
+            KVCacheGroupSpec(
+                ["sliding_window_layer"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=num_prompt_blocks * block_size,
+                ),
+            ),
+        ],
+    )
+    scheduler = create_scheduler(
+        vllm_config,
+        num_blocks=num_blocks,
+        kv_cache_config=kv_cache_config,
+    )
+
+    failed_request = create_request(
+        num_tokens=num_prompt_blocks * block_size,
+        block_size=block_size,
+    )
+    scheduler.add_request(failed_request)
+
+    num_external_computed_tokens = num_external_computed_blocks * block_size
+    scheduler.connector = Mock(spec=NixlBaseConnector)
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        _make_get_num_new_matched_tokens(
+            {
+                failed_request.request_id: num_external_computed_tokens,
+            },
+            False,
+        )
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.request_finished_all_groups.return_value = (
+        False,
+        None,
+    )
+    scheduler.connector.take_events.return_value = ()
+
+    scheduler_output = scheduler.schedule()
+    block_ids_by_group = scheduler_output.scheduled_new_reqs[0].block_ids
+
+    assert len(block_ids_by_group) == num_kv_cache_groups
+    invalid_block_id = block_ids_by_group[-1][invalid_block_idx]
+    model_runner_output = create_model_runner_output(
+        [failed_request],
+        invalid_block_ids={invalid_block_id},
+        use_eos=False,
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert failed_request.status == RequestStatus.FINISHED_ERROR
+    assert failed_request.request_id not in scheduler.requests
+    assert failed_request not in scheduler.running
+    assert len(outputs) == 1
+    engine_output = next(iter(outputs.values())).outputs[0]
+    assert engine_output.request_id == failed_request.request_id
+    assert engine_output.finish_reason == FinishReason.ERROR
+
+    healthy_request = create_request(
+        num_tokens=2 * block_size,
+        block_size=block_size,
+    )
+    scheduler.add_request(healthy_request)
+    next_scheduler_output = scheduler.schedule()
+
+    assert healthy_request.request_id in next_scheduler_output.num_scheduled_tokens
+    assert healthy_request.status == RequestStatus.RUNNING
 
 
 def test_sync_recompute_handles_mixed_kv_group_block_sizes():
