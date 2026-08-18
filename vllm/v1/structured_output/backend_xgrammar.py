@@ -156,11 +156,12 @@ class XgrammarGrammar(StructuredOutputGrammar):
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
 
-        Returns True if the FSM was advanced successfully.
-        Returns False if the FSM failed to advance.
+        Returns True if all grammar-constrained tokens were accepted.
+        Tokens after termination are ignored. Returns False if the FSM
+        failed to advance.
         """
         if self._is_terminated:
-            return False
+            return True
         for token in tokens:
             if not self.matcher.accept_token(token):
                 logger.error(
@@ -171,7 +172,9 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 )
                 return False
             self.num_processed_tokens += 1
-        self._is_terminated = self.matcher.is_terminated()
+            self._is_terminated = self.matcher.is_terminated()
+            if self._is_terminated:
+                break
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
@@ -187,9 +190,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
         for token in tokens:
             if self.matcher.accept_token(token):
                 accepted_tokens.append(token)
-                # A speculative block may extend beyond the grammar's stop
-                # token. Tokens after that boundary belong to no valid grammar
-                # state and must be trimmed without calling the matcher again.
                 if self.matcher.is_terminated():
                     break
             else:
@@ -211,8 +211,9 @@ class XgrammarGrammar(StructuredOutputGrammar):
         return self._is_terminated
 
     def reset(self):
-        self.num_processed_tokens = 0
         self.matcher.reset()
+        self.num_processed_tokens = 0
+        self._is_terminated = False
 
 
 # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc

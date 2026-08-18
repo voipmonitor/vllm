@@ -28,6 +28,11 @@ class _TerminatingMatcher:
         self.rollback_count = num_tokens
         self.terminated = False
 
+    def reset(self) -> None:
+        self.accepted_tokens.clear()
+        self.terminated = False
+        self.rollback_count = 0
+
 
 def test_validate_tokens_stops_at_grammar_termination():
     """Speculative validation trims every token after the stop token."""
@@ -54,3 +59,39 @@ def test_validate_tokens_skips_an_already_terminated_grammar():
 
     assert grammar.validate_tokens([1, 2]) == []
     assert matcher.accepted_tokens == []
+
+
+def test_accept_tokens_stops_at_grammar_termination():
+    """Committed token batches do not advance beyond grammar termination."""
+    matcher = _TerminatingMatcher(terminating_token=2)
+    grammar = XgrammarGrammar(vocab_size=8, matcher=matcher, ctx=Mock())
+
+    assert grammar.accept_tokens("request", [1, 2, 3, 4])
+    assert grammar.is_terminated()
+    assert grammar.num_processed_tokens == 2
+    assert matcher.accepted_tokens == [1, 2]
+
+
+def test_accept_tokens_after_termination_is_a_noop():
+    """Scheduler re-entry after termination preserves the terminal state."""
+    matcher = _TerminatingMatcher(terminating_token=2)
+    grammar = XgrammarGrammar(vocab_size=8, matcher=matcher, ctx=Mock())
+    assert grammar.accept_tokens("request", [1, 2])
+
+    assert grammar.accept_tokens("request", [3, 4])
+    assert grammar.num_processed_tokens == 2
+    assert matcher.accepted_tokens == [1, 2]
+
+
+def test_reset_clears_matcher_and_grammar_state():
+    """A reset grammar accepts a new sequence from its initial state."""
+    matcher = _TerminatingMatcher(terminating_token=2)
+    grammar = XgrammarGrammar(vocab_size=8, matcher=matcher, ctx=Mock())
+    assert grammar.accept_tokens("request", [1, 2])
+
+    grammar.reset()
+
+    assert not grammar.is_terminated()
+    assert grammar.num_processed_tokens == 0
+    assert matcher.accepted_tokens == []
+    assert grammar.accept_tokens("request", [1])
