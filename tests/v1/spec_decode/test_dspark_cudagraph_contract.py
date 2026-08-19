@@ -15,6 +15,7 @@ def test_dspark_generate_draft_accepts_dflash_capture_contract():
     speculator = SimpleNamespace(
         num_query_per_req=5,
         capacity_activation_batch_size=1,
+        _markov_outside_cudagraph=False,
         _speculative_steps_for_query_len=Mock(return_value=5),
         _run_model=Mock(return_value=head_hidden),
         _sample_sequential=Mock(),
