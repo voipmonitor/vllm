@@ -687,8 +687,16 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
-        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        dspark_draft_tokens = (
+            spec.num_speculative_tokens if spec is not None and spec.use_dspark() else 0
+        )
+        draft_slots = (
+            spec.max_num_new_slots_for_drafting
+            if spec is not None and not spec.use_dspark()
+            else 0
+        )
         input_budget = self.scheduler_config.max_num_batched_tokens
+        draft_input_budget = input_budget
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -787,7 +795,7 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if input_budget <= draft_slots:
+            if input_budget <= draft_slots or draft_input_budget < dspark_draft_tokens:
                 break
 
             if (
@@ -940,6 +948,7 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
+                            draft_input_budget += dspark_draft_tokens
                             if preempted_req_id in scheduled_prefill_req_ids:
                                 assert prefill_budget_remaining is not None
                                 prefill_budget_remaining += restored
@@ -986,6 +995,7 @@ class Scheduler(SchedulerInterface):
                 all_scheduled_prefill_req_ids.add(request_id)
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            draft_input_budget -= dspark_draft_tokens
             if running_prefill_limit is not None:
                 assert prefill_budget_remaining is not None
                 prefill_budget_remaining -= num_new_tokens
@@ -1041,7 +1051,10 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if input_budget <= draft_slots:
+                if (
+                    input_budget <= draft_slots
+                    or draft_input_budget < dspark_draft_tokens
+                ):
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -1462,6 +1475,7 @@ class Scheduler(SchedulerInterface):
                     all_scheduled_prefill_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                draft_input_budget -= dspark_draft_tokens
                 if waiting_prefill_limit is not None:
                     assert prefill_budget_remaining is not None
                     prefill_budget_remaining -= num_new_tokens
@@ -1513,6 +1527,7 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
+        assert draft_input_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
