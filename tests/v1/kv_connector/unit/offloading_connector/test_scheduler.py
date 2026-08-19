@@ -2838,6 +2838,97 @@ class TestEagle:
         # 3 hits, pop to 2 → 2 * block_size = 8 tokens loadable
         assert sched._lookup(req_status) == 8
 
+    def test_full_attn_lookup_rewinds_one_hash_unit(self, request_runner):
+        """A loaded full-attention tail block supports a partial hash hit."""
+        hash_size = 4
+        groups = [
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=hash_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                FullAttentionSpec(
+                    block_size=hash_size * 3,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                is_eagle_group=True,
+            ),
+        ]
+        runner = request_runner(
+            block_size=hash_size,
+            num_gpu_blocks=100,
+            async_scheduling=False,
+            kv_cache_groups=groups,
+        )
+        runner.manager.lookup.return_value = LookupResult.HIT
+        sched = runner.connector_scheduler
+        assert sched.config.tokens_per_hash == hash_size
+        assert sched.config.kv_group_configs[1].eagle_rewind_tokens == hash_size
+        assert sched._replay_reserve_tokens == hash_size
+        req_status = self._make_req_status(
+            sched,
+            num_tokens=hash_size * 3,
+            offload_keys_per_group=[[1, 2, 3], [3]],
+        )
+
+        # The 12-token physical draft block is loaded, while its final
+        # four-token hash unit is recomputed.
+        assert sched._lookup(req_status) == hash_size * 2
+
+    def test_sliding_window_lookup_keeps_chunk_aligned_rewind(self, request_runner):
+        """Sliding-window draft replay remains physical-chunk aligned."""
+        hash_size = 4
+        draft_block_size = 12
+        groups = [
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=hash_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=draft_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=draft_block_size * 2,
+                ),
+                is_eagle_group=True,
+            ),
+        ]
+        runner = request_runner(
+            block_size=hash_size,
+            num_gpu_blocks=100,
+            async_scheduling=False,
+            kv_cache_groups=groups,
+        )
+        runner.manager.lookup.return_value = LookupResult.HIT
+        sched = runner.connector_scheduler
+        assert sched.config.kv_group_configs[1].eagle_rewind_tokens == draft_block_size
+        assert sched._replay_reserve_tokens == draft_block_size
+        req_status = self._make_req_status(
+            sched,
+            num_tokens=draft_block_size * 2 + 1,
+            offload_keys_per_group=[list(range(1, 7)), [1, 2]],
+        )
+
+        # Two cached chunks cannot satisfy the two-chunk window plus the
+        # verification chunk. Prefix fallback finds both and rewinds one.
+        assert sched._lookup(req_status) == draft_block_size
+
     def test_full_attn_lookup_single_block_returns_zero(self, request_runner):
         """Full-attn eagle group with 1 block hit → pop to 0 → returns 0."""
         block_size = 4
@@ -3500,6 +3591,61 @@ class TestEagle:
                 (1, 0),
                 (1, 1),
             ),
+        )
+
+    @pytest.mark.parametrize("async_scheduling", [True, False])
+    def test_full_attn_hash_rewind_loads_physical_tail_block(
+        self, request_runner, async_scheduling: bool
+    ):
+        """A hash-aligned hit loads the containing draft cache block."""
+        hash_size = 4
+        draft_block_size = hash_size * 3
+        kv_cache_groups = [
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=hash_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                FullAttentionSpec(
+                    block_size=draft_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                is_eagle_group=True,
+            ),
+        ]
+        runner = request_runner(
+            block_size=hash_size,
+            num_gpu_blocks=100,
+            async_scheduling=async_scheduling,
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        runner.new_request(token_ids=[0] * draft_block_size)
+        runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(keys)
+        )
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_stored=((0, 0), (0, 1), (0, 2), (1, 0)),
+        )
+
+        runner.scheduler.reset_prefix_cache()
+        runner.new_request(token_ids=[0] * draft_block_size + [1])
+        runner.manager.lookup.return_value = LookupResult.HIT
+        runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output([])
+        )
+        runner.run(
+            decoded_tokens=[EOS_TOKEN_ID],
+            expected_loaded=((0, 0), (0, 1), (1, 0)),
         )
 
 

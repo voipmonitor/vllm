@@ -106,10 +106,20 @@ class GroupOffloadConfig(NamedTuple):
     # much smaller block sizes than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_chunk_count: int | None = None
-    # True for EAGLE/MTP draft-model attention groups. The trailing chunk
-    # of these groups is volatile and lacks a stable hash, so it must
-    # be excluded from store and load scheduling.
+    # True for EAGLE/MTP draft-model attention groups. Their trailing decode
+    # chunk is not stored until it becomes stable. A restored full-attention
+    # chunk can retain its stable prefix and recompute only its final hash
+    # unit; sliding-window lookup remains cache-chunk aligned.
     is_eagle_group: bool = False
+
+    @property
+    def eagle_rewind_tokens(self) -> int:
+        """Tokens recomputed after an EAGLE/MTP external-cache match."""
+        if not self.is_eagle_group:
+            return 0
+        if self.sliding_window_size_in_chunks is not None:
+            return self.tokens_per_chunk
+        return self.tokens_per_chunk // self.hashes_per_chunk
 
 
 def get_sliding_window_size_in_chunks(
@@ -262,8 +272,8 @@ class SchedulerOffloadConfig(NamedTuple):
         if eagle_groups:
             logger.info(
                 "KV offloading: EAGLE/MTP draft attention groups %s "
-                "detected. The trailing chunk of these groups will be "
-                "excluded from offloading due to volatility.",
+                "detected. Volatile decode tails are excluded from stores "
+                "and recomputed after restores.",
                 sorted(eagle_groups),
             )
 
@@ -595,13 +605,12 @@ class OffloadingConnectorScheduler:
         )
 
         # Tokens that must remain past a replay boundary for it to be
-        # servable: the last prompt token is always recomputed (hence the
-        # default of 1), and each EAGLE/MTP group must be able to match one
-        # complete chunk past the boundary (its "+1 peek", dropped after
-        # verification in _lookup).
+        # serviceable. The last prompt token is always recomputed. EAGLE/MTP
+        # full-attention groups rewind one hash unit inside the loaded tail
+        # chunk; sliding-window groups retain their complete peek chunk.
         self._replay_reserve_tokens: int = max(
             (
-                group_config.tokens_per_chunk
+                group_config.eagle_rewind_tokens
                 for group_config in self.config.kv_group_configs
                 if group_config.is_eagle_group
             ),
@@ -797,9 +806,9 @@ class OffloadingConnectorScheduler:
         defer_lookup = False
         lookup_groups = self._lookup_groups
 
-        # Tracks which eagle groups have already popped their volatile trailing chunk
+        # Tracks which eagle groups have already rewound their volatile tail
         # in the current convergence iteration. Reset when a non-eagle group
-        # tightens the hit boundary, requiring a fresh pop.
+        # tightens the hit boundary, requiring a fresh rewind.
         eagle_verified: set[int] = set()
         while lookup_groups:
             looked_up_sliding_window: bool = False
@@ -825,8 +834,14 @@ class OffloadingConnectorScheduler:
                 max_hit_size_tokens = min(
                     max_hit_size_tokens, len(offload_keys) * tokens_per_chunk
                 )
-                if max_hit_size_tokens - num_computed_tokens < tokens_per_chunk:
-                    # We can only load less than a chunk, so skip.
+                minimum_load_tokens = (
+                    group_config.eagle_rewind_tokens
+                    if group_config.is_eagle_group
+                    else tokens_per_chunk
+                )
+                if max_hit_size_tokens - num_computed_tokens < minimum_load_tokens:
+                    # A full physical tail chunk can back a hash-aligned
+                    # full-attention hit; all other matches stay chunk aligned.
                     return 0
 
                 sliding_window_size_in_chunks = (
@@ -872,18 +887,22 @@ class OffloadingConnectorScheduler:
                 if num_hit_chunks is None:
                     defer_lookup = True
                 else:
+                    hit_end_tokens = tokens_per_chunk * (
+                        start_chunk_idx + num_hit_chunks
+                    )
                     if is_eagle_unverified:
-                        num_hit_chunks -= 1
+                        hit_end_tokens -= group_config.eagle_rewind_tokens
                         eagle_verified.add(group_idx)
 
                     max_hit_size_tokens = min(
                         max_hit_size_tokens,
-                        tokens_per_chunk * (start_chunk_idx + num_hit_chunks),
+                        hit_end_tokens,
                     )
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
-                if new_num_hit_tokens < tokens_per_chunk:
-                    # We can only load less than a chunk, so skip.
+                if new_num_hit_tokens < minimum_load_tokens:
+                    # A full physical tail chunk can back a hash-aligned
+                    # full-attention hit; all other matches stay chunk aligned.
                     return 0
 
                 if new_num_hit_tokens < num_hit_tokens:
