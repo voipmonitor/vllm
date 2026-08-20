@@ -260,6 +260,11 @@ class KimiMLP(nn.Module):
             x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        # The gated activation no longer reads the packed gate/up projection.
+        # Release that large prefill tensor before down_proj allocates its
+        # output; retaining both tensors can exceed the available device
+        # memory at large scheduler chunk sizes.
+        del gate_up
         x, _ = self.down_proj(x)
         if self.shard_sequence_parallel:
             x = sp_reduce_scatter(x)
