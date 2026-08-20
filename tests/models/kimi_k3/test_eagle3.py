@@ -305,3 +305,61 @@ def test_kimi_post_attn_norm_reuses_dead_input(monkeypatch):
     assert regular_hidden is attention_output
     assert regular_prefix is prefix
     assert outputs == [prefix, attention_output]
+
+
+def test_kimi_linear_forward_streams_auxiliary_states(monkeypatch):
+    model = _make_kimi_linear_model()
+    initial_hidden_states = torch.tensor([[1.0, 2.0]])
+    layer_hidden_states = torch.tensor([[3.0, 4.0]])
+    layer_residual = torch.tensor([[5.0, 6.0]])
+    projected = torch.tensor([[11.0, 12.0]])
+
+    class Projector:
+        def __init__(self):
+            self.calls = []
+            self.started_with = None
+
+        def can_stream_auxiliary_states(self, layer_ids, hidden_states):
+            return layer_ids == (0, 1) and hidden_states is initial_hidden_states
+
+        def begin_auxiliary_stream(self, hidden_states):
+            self.started_with = hidden_states
+
+        def accumulate_auxiliary_state(self, primary, residual):
+            self.calls.append((primary, residual))
+
+        def finish_auxiliary_stream(self):
+            return projected
+
+    projector = Projector()
+    model.set_aux_hidden_state_projector(projector)
+    object.__setattr__(model, "start_layer", 0)
+    object.__setattr__(model, "end_layer", 1)
+    object.__setattr__(
+        model,
+        "layers",
+        [Mock(return_value=(layer_hidden_states, None, layer_residual))],
+    )
+    object.__setattr__(model, "aux_hidden_state_layers", (0, 1))
+    object.__setattr__(model, "use_attn_res", False)
+    monkeypatch.setattr(
+        kimi_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    output, aux_hidden_states = model.forward(
+        input_ids=None,
+        positions=torch.tensor([0]),
+        intermediate_tensors=None,
+        inputs_embeds=initial_hidden_states,
+    )
+
+    torch.testing.assert_close(output, layer_hidden_states + layer_residual)
+    assert projector.started_with is initial_hidden_states
+    assert projector.calls == [
+        (initial_hidden_states, None),
+        (layer_hidden_states, layer_residual),
+    ]
+    assert len(aux_hidden_states) == 1
+    assert aux_hidden_states[0] is projected
