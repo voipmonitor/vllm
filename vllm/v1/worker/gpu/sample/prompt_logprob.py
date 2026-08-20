@@ -14,6 +14,10 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.worker.gpu.distribution_capture import (
+    capture_live_prompt_logits,
+    live_prompt_logit_capture_enabled,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 
@@ -165,7 +169,7 @@ class PromptLogprobsWorker:
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
         is_prompt_chunked = pos_after_step < prompt_lens
         query_start_loc_np = input_batch.query_start_loc_np
-        logits_capture: Callable[[torch.Tensor, int], None] | None = None
+        legacy_logits_capture: Callable[[torch.Tensor, int], None] | None = None
         if _should_capture_kld_batch(input_batch.req_ids):
             if len(input_batch.req_ids) != 1 or int(needs_prompt_logprobs.sum()) != 1:
                 raise RuntimeError(
@@ -178,7 +182,9 @@ class PromptLogprobsWorker:
             if not is_prompt_chunked[0]:
                 capture_rows -= 1
 
-            def logits_capture(logits: torch.Tensor, relative_start: int) -> None:
+            def legacy_logits_capture(
+                logits: torch.Tensor, relative_start: int
+            ) -> None:
                 if relative_start >= capture_rows:
                     return
                 rows = min(logits.shape[0], capture_rows - relative_start)
@@ -188,6 +194,41 @@ class PromptLogprobsWorker:
                     start_idx=capture_start + relative_start,
                     vocab_size=self.vocab_size or logits.shape[-1],
                 )
+
+        capture_live_logits = live_prompt_logit_capture_enabled()
+        logits_callback = None
+        if legacy_logits_capture is not None or capture_live_logits:
+
+            def logits_callback(
+                chunk_logits: torch.Tensor,
+                chunk_start: int,
+                chunk_end: int,
+            ) -> None:
+                if legacy_logits_capture is not None:
+                    legacy_logits_capture(chunk_logits, chunk_start)
+                if not capture_live_logits:
+                    return
+                for batch_index, req_id in enumerate(input_batch.req_ids):
+                    if not needs_prompt_logprobs[batch_index]:
+                        continue
+                    request_start = int(query_start_loc_np[batch_index])
+                    request_end = int(query_start_loc_np[batch_index + 1])
+                    if not is_prompt_chunked[batch_index]:
+                        request_end -= 1
+                    overlap_start = max(chunk_start, request_start)
+                    overlap_end = min(chunk_end, request_end)
+                    if overlap_start >= overlap_end:
+                        continue
+                    context_row_start = int(computed_prefill[batch_index]) + (
+                        overlap_start - request_start
+                    )
+                    capture_live_prompt_logits(
+                        chunk_logits[
+                            overlap_start - chunk_start : overlap_end - chunk_start
+                        ],
+                        req_id=req_id,
+                        row_start=context_row_start,
+                    )
 
         # Get the prompt logprobs token_ids.
         prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
@@ -205,7 +246,7 @@ class PromptLogprobsWorker:
                 max_num_prompt_logprobs,
                 logprobs_mode=self.logprobs_mode,
                 chunk_size=self.chunk_size,
-                logits_capture=logits_capture,
+                logits_callback=logits_callback,
             )
         )
         prompt_logprobs_dict: dict[str, LogprobsTensors] = {}
@@ -322,6 +363,7 @@ def compute_prompt_logprobs_with_chunking(
     logprobs_mode: LogprobsMode = "raw_logprobs",
     chunk_size: int = 1024,
     logits_capture: Callable[[torch.Tensor, int], None] | None = None,
+    logits_callback: Callable[[torch.Tensor, int, int], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be greater than zero, got {chunk_size}")
@@ -338,6 +380,8 @@ def compute_prompt_logprobs_with_chunking(
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
         if logits_capture is not None:
             logits_capture(prompt_logits, start_idx)
+        if logits_callback is not None:
+            logits_callback(prompt_logits, start_idx, end_idx)
         requested_num = (
             prompt_logits.shape[-1]
             if num_prompt_logprobs == -1
