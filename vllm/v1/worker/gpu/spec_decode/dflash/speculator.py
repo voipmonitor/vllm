@@ -571,6 +571,27 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots,
         )
 
+    def _dispatch_context_batch(
+        self,
+        num_target_tokens: int,
+        *,
+        context_states_are_streamed: bool,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> BatchExecutionDescriptor:
+        """Select eager execution for streamed caller-owned context states."""
+        if (
+            self.context_cudagraph_manager is not None
+            and not context_states_are_streamed
+            and not (dummy_run or is_profile)
+        ):
+            return self.context_cudagraph_manager.dispatch_context(num_target_tokens)
+        return BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=num_target_tokens,
+            num_reqs=None,
+        )
+
     def _generate_draft(
         self,
         num_reqs: int,
@@ -719,20 +740,38 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
+        is_streamed_context_states = getattr(
+            self.model, "is_streamed_context_states", None
+        )
+        context_states_are_streamed = bool(
+            aux_hidden_states
+            and callable(is_streamed_context_states)
+            and is_streamed_context_states(aux_hidden_states)
+        )
+        if context_states_are_streamed:
+            assert aux_hidden_states is not None
+            context_states = aux_hidden_states[0]
+        elif aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
                 torch.cat(aux_hidden_states, dim=-1)
             )
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
+            )
+            context_states = self.hidden_states[:num_target_tokens]
         else:
             hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
+            )
+            context_states = self.hidden_states[:num_target_tokens]
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
+                context_states,
                 self.context_positions[:num_target_tokens],
             )
             # DFlash processes all speculative tokens in one forward pass,
@@ -753,16 +792,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        if self.context_cudagraph_manager is not None and not (dummy_run or is_profile):
-            context_batch_desc = self.context_cudagraph_manager.dispatch_context(
-                num_target_tokens
-            )
-        else:
-            context_batch_desc = BatchExecutionDescriptor(
-                cg_mode=CUDAGraphMode.NONE,
-                num_tokens=num_target_tokens,
-                num_reqs=None,
-            )
+        context_batch_desc = self._dispatch_context_batch(
+            num_target_tokens,
+            context_states_are_streamed=context_states_are_streamed,
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+        )
         context_num_tokens_padded = context_batch_desc.num_tokens
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
@@ -832,11 +867,19 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self._precompute_context_kv(
-            num_target_tokens,
-            context_batch_desc,
-            context_slots,
-        )
+        if context_states_are_streamed:
+            assert context_batch_desc.cg_mode == CUDAGraphMode.NONE
+            self.model.precompute_and_store_context_kv(
+                context_states,
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
+        else:
+            self._precompute_context_kv(
+                num_target_tokens,
+                context_batch_desc,
+                context_slots,
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
