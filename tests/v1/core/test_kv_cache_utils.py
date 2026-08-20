@@ -58,6 +58,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_dcp_shard_count,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -195,6 +196,16 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_mamba_cache_has_one_dcp_token_position_shard():
+    spec = new_mamba_spec(block_size=768, num_speculative_blocks=7)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align")
+    )
+
+    assert get_kv_cache_dcp_shard_count(spec, dcp_world_size=16) == 1
+    assert spec.max_num_blocks_per_req(vllm_config, max_len=1_000_000) == 1310
 
 
 def test_unify_kv_cache_spec_page_size_uses_lcm_for_non_divisible_pages():
