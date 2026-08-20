@@ -1308,6 +1308,9 @@ class KimiDecoderLayer(nn.Module):
 
         attn_res_block_size = config.attn_res_block_size
         self.use_attn_res = attn_res_block_size is not None
+        self.reuse_attn_res_output = (
+            self.use_attn_res and current_platform.is_device_capability_family(120)
+        )
         if self.use_attn_res:
             assert attn_res_block_size is not None
             self.attn_res_block_size = attn_res_block_size
@@ -1356,6 +1359,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor | None,
         prefix_sum: torch.Tensor | None,
+        attn_res_scratch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         if not self.use_attn_res:
             assert hidden_states is not None
@@ -1379,6 +1383,9 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
             eps=self.self_attention_res_norm.variance_epsilon,
             output_norm_eps=self.input_layernorm.variance_epsilon,
+            output=(hidden_states if hidden_states is not None else attn_res_scratch)
+            if self.reuse_attn_res_output
+            else None,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1396,10 +1403,12 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         if self.is_block_write_layer:
+            output = prefix_sum if self.reuse_attn_res_output else None
             prefix_sum = hidden_states
             prefix_delta = None
         else:
             prefix_delta = hidden_states
+            output = prefix_delta if self.reuse_attn_res_output else None
         mlp_valid_blocks = self.prev_valid_blocks + self.is_block_write_layer
         hidden_states = attn_res(
             prefix_sum,
@@ -1412,6 +1421,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=-1,
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            output=output,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1421,10 +1431,11 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor | None,
         prefix_sum: torch.Tensor | None = None,
+        attn_res_scratch: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         hidden_states, prefix_sum, residual = self._pre_attn_norm(
-            hidden_states, residual, prefix_sum
+            hidden_states, residual, prefix_sum, attn_res_scratch
         )
         assert hidden_states is not None
 
@@ -1471,6 +1482,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.config = config
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
+        self.reuse_attn_res_output = (
+            self.use_attn_res and current_platform.is_device_capability_family(120)
+        )
         parallel_config = vllm_config.parallel_config
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         self.use_sequence_parallel = (
@@ -1682,6 +1696,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             prefix_sum = hidden_states
             hidden_states = None
             residual = block_residual
+            # The final block is not an AttnRes input until the final block
+            # boundary, so its storage can hold the first normalized output.
+            attn_res_scratch = (
+                block_residual[:, -1]
+                if self.reuse_attn_res_output and self.num_attn_res_blocks > 1
+                else None
+            )
+        else:
+            attn_res_scratch = None
 
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
@@ -1692,6 +1715,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 hidden_states=hidden_states,
                 prefix_sum=prefix_sum,
                 residual=residual,
+                attn_res_scratch=attn_res_scratch,
             )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if self.use_attn_res:
@@ -1728,6 +1752,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 block_write_idx=-1,
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
+                output=(hidden_states if self.reuse_attn_res_output else None),
             )
         else:
             hidden_states = hidden_states + residual
