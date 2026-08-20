@@ -142,6 +142,19 @@ logger = init_logger(__name__)
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
 
+def _release_cuda_cache_before_retained_allocation(device: torch.device) -> None:
+    """Give retained post-load storage a dedicated allocator segment.
+
+    A persistent allocation must not pin the unused part of a large cached
+    segment left by quantization repacking.  KV cache allocation follows this
+    hook and needs every otherwise-inactive segment to be releasable.
+    """
+    if device.type != "cuda":
+        return
+    torch.accelerator.synchronize(device)
+    torch.accelerator.empty_cache()
+
+
 def _uses_native_b12x_mxfp4_intermediate_size(
     vllm_config: VllmConfig,
 ) -> bool:
@@ -1226,6 +1239,9 @@ class KimiDecoderLayer(nn.Module):
 
         attn_res_block_size = config.attn_res_block_size
         self.use_attn_res = attn_res_block_size is not None
+        self.reuse_attn_res_output = (
+            self.use_attn_res and current_platform.is_device_capability_family(120)
+        )
         if self.use_attn_res:
             assert attn_res_block_size is not None
             self.attn_res_block_size = attn_res_block_size
@@ -1274,6 +1290,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor | None,
         prefix_sum: torch.Tensor | None,
+        attn_res_scratch: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         if not self.use_attn_res:
             assert hidden_states is not None
@@ -1297,6 +1314,9 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
             eps=self.self_attention_res_norm.variance_epsilon,
             output_norm_eps=self.input_layernorm.variance_epsilon,
+            output=(hidden_states if hidden_states is not None else attn_res_scratch)
+            if self.reuse_attn_res_output
+            else None,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1314,10 +1334,12 @@ class KimiDecoderLayer(nn.Module):
 
         assert prefix_sum is not None
         if self.is_block_write_layer:
+            output = prefix_sum if self.reuse_attn_res_output else None
             prefix_sum = hidden_states
             prefix_delta = None
         else:
             prefix_delta = hidden_states
+            output = prefix_delta if self.reuse_attn_res_output else None
         mlp_valid_blocks = self.prev_valid_blocks + self.is_block_write_layer
         hidden_states = attn_res(
             prefix_sum,
@@ -1330,6 +1352,7 @@ class KimiDecoderLayer(nn.Module):
             block_write_idx=-1,
             eps=self.mlp_res_norm.variance_epsilon,
             output_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            output=output,
         )
         return hidden_states, prefix_sum, residual
 
@@ -1339,10 +1362,11 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor | None,
         residual: torch.Tensor | None,
         prefix_sum: torch.Tensor | None = None,
+        attn_res_scratch: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         hidden_states, prefix_sum, residual = self._pre_attn_norm(
-            hidden_states, residual, prefix_sum
+            hidden_states, residual, prefix_sum, attn_res_scratch
         )
         assert hidden_states is not None
 
@@ -1384,6 +1408,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.config = config
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
+        self.reuse_attn_res_output = (
+            self.use_attn_res and current_platform.is_device_capability_family(120)
+        )
         parallel_config = vllm_config.parallel_config
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         self.use_sequence_parallel = (
@@ -1427,6 +1454,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if self.attn_res_block_size is not None
             else 0
         )
+        self._max_num_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._model_dtype = vllm_config.model_config.dtype
+        self._attn_res_workspace: torch.Tensor | None
+        self.register_buffer("_attn_res_workspace", None, persistent=False)
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1478,6 +1511,71 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _get_attn_res_workspace(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return retained AttnRes storage for the active token rows."""
+        shape = (
+            hidden_states.size(0),
+            self.num_attn_res_blocks,
+            hidden_states.size(1),
+        )
+        workspace = self._attn_res_workspace
+        if (
+            workspace is None
+            or workspace.device != hidden_states.device
+            or workspace.dtype != hidden_states.dtype
+            or workspace.size(0) < shape[0]
+            or workspace.size(1) != shape[1]
+            or workspace.size(2) != shape[2]
+        ):
+            # Physical block-major storage keeps every token-major block view
+            # contiguous for AttnRes kernels and later buffer reuse.
+            workspace = hidden_states.new_empty(
+                shape[1],
+                shape[0],
+                shape[2],
+            ).permute(1, 0, 2)
+            self._attn_res_workspace = workspace
+        return workspace[: shape[0]]
+
+    def reserve_attn_res_workspace(self) -> None:
+        """Reserve maximum-size AttnRes storage before KV cache allocation.
+
+        Chunked prefill reuses one allocation for every scheduler chunk. Early
+        reservation prevents model-load and CUDA-graph allocations from
+        fragmenting the contiguous block required by a maximum-size chunk.
+        """
+        if not self.use_attn_res or self.num_attn_res_blocks == 0:
+            return
+        shape = (
+            self._max_num_batched_tokens,
+            self.num_attn_res_blocks,
+            self.config.hidden_size,
+        )
+        workspace = self._attn_res_workspace
+        parameter = next(self.parameters())
+        if (
+            workspace is None
+            or workspace.device != parameter.device
+            or workspace.dtype != self._model_dtype
+            or tuple(workspace.shape) != shape
+        ):
+            _release_cuda_cache_before_retained_allocation(parameter.device)
+            self._attn_res_workspace = torch.empty(
+                shape[1],
+                shape[0],
+                shape[2],
+                dtype=self._model_dtype,
+                device=parameter.device,
+            ).permute(1, 0, 2)
+            logger.info_once(
+                "Kimi-K3 retained %.2f MiB/rank for the %d-token AttnRes "
+                "prefill workspace.",
+                self._attn_res_workspace.numel()
+                * self._attn_res_workspace.element_size()
+                / (1024**2),
+                self._max_num_batched_tokens,
+            )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1518,16 +1616,21 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         prefix_sum = None
         if self.use_attn_res:
-            block_residual = hidden_states.new_empty(
-                hidden_states.size(0),
-                self.num_attn_res_blocks,
-                hidden_states.size(1),
-            )
+            block_residual = self._get_attn_res_workspace(hidden_states)
             if residual is not None:
                 block_residual[:, : residual.size(1), :].copy_(residual)
             prefix_sum = hidden_states
             hidden_states = None
             residual = block_residual
+            # The final block is not an AttnRes input until the final block
+            # boundary, so its storage can hold the first normalized output.
+            attn_res_scratch = (
+                block_residual[:, -1]
+                if self.reuse_attn_res_output and self.num_attn_res_blocks > 1
+                else None
+            )
+        else:
+            attn_res_scratch = None
 
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
@@ -1538,6 +1641,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 hidden_states=hidden_states,
                 prefix_sum=prefix_sum,
                 residual=residual,
+                attn_res_scratch=attn_res_scratch,
             )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if self.use_attn_res:
@@ -1574,6 +1678,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 block_write_idx=-1,
                 eps=self.output_attn_res_norm.variance_epsilon,
                 output_norm_eps=0.0,
+                output=(hidden_states if self.reuse_attn_res_output else None),
             )
         else:
             hidden_states = hidden_states + residual
@@ -1909,6 +2014,9 @@ class KimiLinearForCausalLM(
         # (W_UK_T / W_UV absorption) is driven by the loader's generic post-load
         # hook for any AttentionLayerBase, so no manual trigger is needed here.
         return loaded
+
+    def process_weights_after_loading(self) -> None:
+        self.model.reserve_attn_res_workspace()
 
 
 def get_spec_layer_idx_from_weight_name(
@@ -2374,3 +2482,6 @@ class KimiK3ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
