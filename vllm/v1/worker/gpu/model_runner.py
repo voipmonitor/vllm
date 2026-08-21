@@ -616,7 +616,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_sizes = []
         max_num_blocks_per_group = []
         group_cp_sizes = []
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
+        for group_index, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
             group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
@@ -634,6 +634,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 max_num_blocks = get_block_table_width(max_num_blocks, spec.block_size)
             max_num_blocks_per_group.append(max_num_blocks)
+
+            legacy_group_cp_size = (
+                1
+                if isinstance(spec, MambaSpec)
+                or bool(getattr(spec, "dcp_replicated", False))
+                else int(getattr(spec, "dcp_kv_shard_count", None) or self.dcp_size)
+            )
+            legacy_max_num_blocks = (
+                block_table_max_model_len + spec.block_size * legacy_group_cp_size - 1
+            ) // (spec.block_size * legacy_group_cp_size)
+            if isinstance(spec, MambaSpec):
+                if not self.cache_config.enable_prefix_caching:
+                    legacy_max_num_blocks = 1
+                legacy_max_num_blocks += spec.num_speculative_blocks
+                legacy_max_num_blocks = get_block_table_width(
+                    legacy_max_num_blocks, spec.block_size, token_alignment=None
+                )
+            else:
+                legacy_max_num_blocks = get_block_table_width(
+                    legacy_max_num_blocks, spec.block_size
+                )
+            logger.warning(
+                "KV geometry comparison group=%d spec=%s layers=%d "
+                "block_size=%d effective_dcp=%d legacy_effective_dcp=%d "
+                "table_width=%d legacy_table_width=%d mamba_cache_mode=%s "
+                "prefix_caching=%s",
+                group_index,
+                type(spec).__name__,
+                len(kv_cache_group.layer_names),
+                spec.block_size,
+                group_cp_size,
+                legacy_group_cp_size,
+                max_num_blocks,
+                legacy_max_num_blocks,
+                self.cache_config.mamba_cache_mode,
+                self.cache_config.enable_prefix_caching,
+            )
 
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
