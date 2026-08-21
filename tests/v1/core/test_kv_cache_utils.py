@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -126,6 +127,7 @@ def new_kv_cache_spec(
     attention_chunk_size=None,
     indexes_kv_by_block_stride=False,
     kv_quant_mode=KVQuantMode.NONE,
+    dcp_replicated=False,
 ):
     return FullAttentionSpec(
         block_size=block_size,
@@ -137,6 +139,7 @@ def new_kv_cache_spec(
         attention_chunk_size=attention_chunk_size,
         indexes_kv_by_block_stride=indexes_kv_by_block_stride,
         kv_quant_mode=kv_quant_mode,
+        dcp_replicated=dcp_replicated,
     )
 
 
@@ -148,6 +151,7 @@ def new_sliding_window_spec(
     page_size_padded=None,
     sliding_window=1,
     indexes_kv_by_block_stride=False,
+    dcp_replicated=False,
 ):
     return SlidingWindowSpec(
         block_size=block_size,
@@ -157,6 +161,7 @@ def new_sliding_window_spec(
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
         indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+        dcp_replicated=dcp_replicated,
     )
 
 
@@ -1324,6 +1329,7 @@ def test_project_kv_cache_groups_to_worker():
     [
         ("mla", 1, 64),
         ("mla", 2, 32),
+        ("replicated", 4, 64),
         # Mamba state is replicated, not DCP-sharded, and its width is the
         # resident state block count rather than cdiv(max_len, block_size).
         ("mamba", 2, 3),
@@ -1335,9 +1341,17 @@ def test_uniform_type_spec_block_table_width_matches_layer_spec(
     # The runner sizes the block table from the group spec while the metadata
     # builders are constructed from the per-layer spec, so the aggregate must
     # report the same width as the layers it wraps.
-    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=1024))
-    vllm_config.parallel_config.decode_context_parallel_size = dcp_size
-    layer_spec = new_mla_spec() if layer_type == "mla" else new_mamba_spec()
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size),
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        model_config=SimpleNamespace(max_model_len=1024),
+    )
+    if layer_type == "mla":
+        layer_spec = new_mla_spec()
+    elif layer_type == "replicated":
+        layer_spec = new_kv_cache_spec(dcp_replicated=True)
+    else:
+        layer_spec = new_mamba_spec()
     uniform_spec = UniformTypeKVCacheSpecs(
         block_size=layer_spec.block_size,
         kv_cache_specs={"layer1": layer_spec, "layer2": layer_spec},
@@ -2107,6 +2121,14 @@ def test_generate_uniform_type_kv_cache_specs():
     uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_cache_specs)
     assert uniform_spec is None
 
+    # Sharded and replicated layouts require distinct block tables and
+    # attention metadata even when their physical page shapes match.
+    kv_cache_specs = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_kv_cache_spec(dcp_replicated=True),
+    }
+    assert UniformTypeKVCacheSpecs.from_specs(kv_cache_specs) is None
+
     # different order of full attention + sliding window, cannot be merged
     kv_cache_specs = {
         "layer_1": new_sliding_window_spec(sliding_window=1),
@@ -2317,6 +2339,97 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     assert kv_cache_utils.resolve_kv_cache_block_sizes(
         kv_cache_config, vllm_config
     ) == (544, 136)
+
+
+def test_resolve_kv_cache_block_sizes_mixed_dcp_topologies():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            enable_prefix_caching=True,
+            prefix_match_unit=None,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        kv_transfer_config=None,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], new_kv_cache_spec()),
+            KVCacheGroupSpec(
+                ["draft"],
+                new_sliding_window_spec(
+                    sliding_window=128,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (64, 16)
+
+
+def test_replicated_attention_keeps_dcp1_cache_geometry():
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        model_config=SimpleNamespace(max_model_len=1024),
+    )
+    sharded = new_kv_cache_spec()
+    replicated = new_kv_cache_spec(dcp_replicated=True)
+
+    assert sharded.get_num_dcp_kv_shards(4) == 4
+    assert replicated.get_num_dcp_kv_shards(4) == 1
+    assert sharded.max_num_blocks_per_req(vllm_config, 1024) == 16
+    assert replicated.max_num_blocks_per_req(vllm_config, 1024) == 64
+    assert replicated.max_memory_usage_bytes(vllm_config) == 4 * (
+        sharded.max_memory_usage_bytes(vllm_config)
+    )
+
+
+def test_uniform_cache_group_rejects_mixed_dcp_topologies():
+    uniform = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            "sharded": new_kv_cache_spec(),
+            "replicated": new_kv_cache_spec(dcp_replicated=True),
+        },
+    )
+
+    with pytest.raises(ValueError, match="same number of DCP KV shards"):
+        uniform.get_num_dcp_kv_shards(4)
+
+
+def test_chunked_attention_topology_is_part_of_uniformity():
+    sharded = ChunkedLocalAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        attention_chunk_size=128,
+    )
+    replicated = replace(sharded, dcp_replicated=True)
+
+    assert not sharded.is_uniform_with_collection(
+        {"sharded": sharded, "replicated": replicated}
+    )
+
+
+def test_resolve_kv_cache_block_sizes_without_cache_groups():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[],
+    )
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (64, 64)
 
 
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():

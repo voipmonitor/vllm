@@ -645,6 +645,14 @@ def hash_block_tokens(
     )
 
 
+def get_effective_kv_cache_block_size(
+    spec: KVCacheSpec,
+    dcp_world_size: int,
+) -> int:
+    """Return one local KV block's global token coverage under DCP."""
+    return spec.block_size * spec.get_num_dcp_kv_shards(dcp_world_size)
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -653,9 +661,9 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp``. Multiple groups: LCM of every
-      group's effective block size. Attention groups are scaled by DCP;
-      Mamba groups keep their full per-rank state and are not scaled.
+      the group's effective block size. Multiple groups: LCM of every group's
+      effective block size. DCP-sharded attention groups are scaled by DCP;
+      recurrent and replicated attention groups are not scaled.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.prefix_match_unit`` override if set, else the GCD of
@@ -667,15 +675,18 @@ def resolve_kv_cache_block_sizes(
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:
+    if not groups:
+        # Preserve the configured scheduler alignment for attention-free
+        # workers, which have no cache specification to define a topology.
         bs = cache_config.block_size * dcp
         return bs, bs
 
+    if len(groups) == 1:
+        bs = get_effective_kv_cache_block_size(groups[0].kv_cache_spec, dcp)
+        return bs, bs
+
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
-        if isinstance(g.kv_cache_spec, AttentionSpec)
-        else g.kv_cache_spec.block_size
-        for g in groups
+        get_effective_kv_cache_block_size(g.kv_cache_spec, dcp) for g in groups
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 

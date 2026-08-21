@@ -76,7 +76,7 @@ class SingleTypeKVCacheManager(ABC):
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
         if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
+            self.block_size *= kv_cache_spec.get_num_dcp_kv_shards(dcp_world_size)
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching
@@ -701,9 +701,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         )
         block_size = kv_cache_spec.block_size
         if dcp_world_size > 1:
-            # DCP shards each block's KV across ranks; hashes must be viewed at
-            # the sharded block size.
-            block_size *= dcp_world_size
+            block_size *= kv_cache_spec.get_num_dcp_kv_shards(dcp_world_size)
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -915,7 +913,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
+        assert dcp_world_size == 1 or kv_cache_spec.dcp_replicated, (
+            "DCP requires a replicated sliding-window cache."
+        )
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
         # Fine-grained partial hits are not supported for sliding window now
         assert alignment_tokens % kv_cache_spec.block_size == 0, (

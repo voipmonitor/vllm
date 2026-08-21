@@ -735,7 +735,10 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                 )
 
         if (
-            self.vllm_config.parallel_config.decode_context_parallel_size > 1
+            self.kv_cache_spec.get_num_dcp_kv_shards(
+                self.vllm_config.parallel_config.decode_context_parallel_size
+            )
+            > 1
             and not supports_dcp_with_varlen
         ):
             self.reorder_batch_threshold = 1

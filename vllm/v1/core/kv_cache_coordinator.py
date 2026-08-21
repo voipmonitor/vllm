@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
 
@@ -510,7 +511,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
         if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
+            self.block_size *= self.kv_cache_spec.get_num_dcp_kv_shards(dcp_world_size)
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
         assert not enable_caching or (hash_block_size == self.block_size), (
@@ -610,14 +611,29 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         if dcp_world_size > 1:
-            # DCP shards full-attention KV across ranks and replicates Mamba
-            # state; other spec types (e.g. sliding window) have no DCP-aware
-            # handling yet, so reject them explicitly.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                spec = g.kv_cache_spec
+                layer_specs = (
+                    spec.kv_cache_specs.values()
+                    if isinstance(spec, UniformTypeKVCacheSpecs)
+                    else (spec,)
+                )
+                unsupported = [
+                    layer_spec
+                    for layer_spec in layer_specs
+                    if not (
+                        isinstance(layer_spec, FullAttentionSpec | MambaSpec)
+                        or (
+                            isinstance(layer_spec, SlidingWindowSpec)
+                            and layer_spec.dcp_replicated
+                        )
+                    )
+                ]
+                assert not unsupported, (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention and Mamba groups, got: "
-                    f"{type(g.kv_cache_spec).__name__}."
+                    "full-attention, Mamba, and replicated sliding-window "
+                    "groups, got: "
+                    f"{', '.join(type(item).__name__ for item in unsupported)}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache
         # managers in every group. TP needs hashing finer than the Mamba block;

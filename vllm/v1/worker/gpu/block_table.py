@@ -26,6 +26,7 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        group_cp_sizes: list[int] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -36,6 +37,17 @@ class BlockTables:
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_interleave = cp_interleave
+
+        if group_cp_sizes is None:
+            group_cp_sizes = [cp_size] * len(block_sizes)
+        if len(group_cp_sizes) != len(block_sizes):
+            raise ValueError("group_cp_sizes must contain one entry per KV cache group")
+        if any(size < 1 or cp_size % size != 0 for size in group_cp_sizes):
+            raise ValueError(
+                "Each KV cache group's DCP shard count must be a positive "
+                f"divisor of the configured DCP size {cp_size}: {group_cp_sizes}"
+            )
+        self.group_cp_sizes = tuple(group_cp_sizes)
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
@@ -88,9 +100,9 @@ class BlockTables:
     def init_block_table_layout_tensors(self) -> None:
         # Called at init and after a CuMem kv_cache wake-up. The ptr tensors
         # cache raw data_ptr() values that go stale once the underlying tensors
-        # are reallocated on wake; block_sizes_tensor needs re-populating
-        # because its storage lives under the kv_cache pool tag and comes back
-        # with undefined contents.
+        # are reallocated on wake; the block-size and group-topology tensors
+        # need re-populating because their storage lives under the kv_cache
+        # pool tag and comes back with undefined contents.
         self.block_table_ptrs = self._make_ptr_tensor(
             [b.gpu for b in self.block_tables]
         )
@@ -101,6 +113,9 @@ class BlockTables:
         )
         self.block_sizes_tensor = torch.tensor(
             self.kernel_block_sizes, dtype=torch.int32, device=self.device
+        )
+        self.group_cp_sizes_tensor = torch.tensor(
+            self.group_cp_sizes, dtype=torch.int32, device=self.device
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
@@ -203,6 +218,7 @@ class BlockTables:
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
+            self.group_cp_sizes_tensor,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
@@ -274,6 +290,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
+    group_cp_sizes,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -301,6 +318,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)
+    group_cp_size = tl.load(group_cp_sizes + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -309,19 +327,20 @@ def _compute_slot_mappings_kernel(
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
 
-        block_indices = positions // (block_size * CP_SIZE)
-        block_offsets = positions % (block_size * CP_SIZE)
+        block_indices = positions // (block_size * group_cp_size)
+        block_offsets = positions % (block_size * group_cp_size)
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices
         )
 
-        if CP_SIZE == 1:
+        if CP_SIZE == 1 or group_cp_size == 1:
             # Common case: Context parallelism is not used.
             slot_ids = block_numbers * block_size + block_offsets
         else:
             # Context parallelism is used.
-            is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
+            group_cp_rank = cp_rank % group_cp_size
+            is_local = block_offsets // CP_INTERLEAVE % group_cp_size == group_cp_rank
+            rounds = block_offsets // (CP_INTERLEAVE * group_cp_size)
             remainder = block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
             slot_ids = block_numbers * block_size + local_offsets

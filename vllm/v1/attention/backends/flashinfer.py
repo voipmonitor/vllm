@@ -759,17 +759,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     self._decode_cudagraph_max_bs,
                     self.compilation_config.max_cudagraph_capture_size,
                 )
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-            self.dcp_kv_cache_interleave_size = (
-                vllm_config.parallel_config.dcp_kv_cache_interleave_size
-            )
-        except AssertionError:
-            # DCP might not be initialized in testing
+        if getattr(kv_cache_spec, "dcp_replicated", False):
             self.dcp_world_size = 1
             self.dcp_rank = 0
             self.dcp_kv_cache_interleave_size = 1
+        else:
+            try:
+                self.dcp_world_size = get_dcp_group().world_size
+                self.dcp_rank = get_dcp_group().rank_in_group
+                self.dcp_kv_cache_interleave_size = (
+                    vllm_config.parallel_config.dcp_kv_cache_interleave_size
+                )
+            except AssertionError:
+                # DCP might not be initialized in testing
+                self.dcp_world_size = 1
+                self.dcp_rank = 0
+                self.dcp_kv_cache_interleave_size = 1
         self.use_dcp = self.dcp_world_size > 1
         self.dcp_a2a = (
             self.use_dcp and vllm_config.parallel_config.dcp_comm_backend == "a2a"
@@ -993,7 +998,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         is_sm12x = current_platform.is_device_capability_family(120)
         # XQA does not return LSE and therefore does not support DCP.
-        if is_sm12x and vllm_config.parallel_config.decode_context_parallel_size > 1:
+        if (
+            is_sm12x
+            and kv_cache_spec.get_num_dcp_kv_shards(
+                vllm_config.parallel_config.decode_context_parallel_size
+            )
+            > 1
+        ):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
         # For UniformTypeKVCacheSpecs, check all contained specs

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
@@ -193,3 +194,46 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+def test_compute_slot_mappings_mixed_sharded_and_replicated_groups():
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[64, 256],
+        max_num_reqs=1,
+        max_num_batched_tokens=8,
+        max_num_blocks_per_group=[1, 1],
+        device=device,
+        kernel_block_sizes=[64, 64],
+        cp_size=4,
+        cp_rank=2,
+        group_cp_sizes=[4, 1],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([5], [5]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    slot_mappings = block_tables.compute_slot_mappings(
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0, 8], dtype=torch.int32, device=device),
+        torch.arange(8, dtype=torch.int64, device=device),
+        num_tokens_padded=8,
+    )
+    torch.accelerator.synchronize()
+
+    assert slot_mappings.cpu().tolist() == [
+        [
+            PAD_SLOT_ID,
+            PAD_SLOT_ID,
+            320,
+            PAD_SLOT_ID,
+            PAD_SLOT_ID,
+            PAD_SLOT_ID,
+            321,
+            PAD_SLOT_ID,
+        ],
+        list(range(1280, 1288)),
+    ]
