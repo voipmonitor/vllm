@@ -59,6 +59,7 @@ class Gemma4DSparkAttention(Gemma4MTPAttention):
             attn_logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
             prefix=prefix,
         )
+        self.attn.dcp_replicated = True
         self.is_kv_shared_layer = False
         self.causal = _dflash_layer_causal(config, layer_idx)
         self.kv_size = self.num_kv_heads * self.head_dim

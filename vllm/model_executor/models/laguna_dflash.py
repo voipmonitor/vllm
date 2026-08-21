@@ -115,6 +115,7 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
             ]
         )
         for layer in self.layers:
+            layer.self_attn.attn.dcp_replicated = True
             if getattr(layer.self_attn, "sliding_window", None) is not None:
                 # DFlash inserts verifier-context K/V at absolute cache slots.
                 # Keep full KV allocation; SWA remains a compute-time limit.

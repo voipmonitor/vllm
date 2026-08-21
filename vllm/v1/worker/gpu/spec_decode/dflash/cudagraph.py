@@ -29,6 +29,8 @@ def _prepare_dflash_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     max_model_len: int,
+    draft_cp_size: int,
+    draft_cp_rank: int,
     skip_attn: bool,
     causal: bool | Mapping[int, bool],
 ) -> AttentionState:
@@ -43,13 +45,13 @@ def _prepare_dflash_inputs_to_capture(
     if not skip_attn:
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         dcp_local_seq_lens = None
-        if block_tables.cp_size > 1:
+        if draft_cp_size > 1:
             prepare_dcp_local_seq_lens(
                 input_buffers.dcp_local_seq_lens,
                 input_buffers.seq_lens,
                 num_reqs,
-                block_tables.cp_size,
-                block_tables.cp_rank,
+                draft_cp_size,
+                draft_cp_rank,
                 block_tables.cp_interleave,
             )
             dcp_local_seq_lens = input_buffers.dcp_local_seq_lens
@@ -84,6 +86,8 @@ class DFlashCudaGraphManager(CudaGraphManager):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
+        draft_cp_size: int,
+        draft_cp_rank: int,
         causal: bool | Mapping[int, bool],
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
@@ -106,6 +110,8 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 max_model_len,
+                draft_cp_size,
+                draft_cp_rank,
                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
                 causal=causal,
             )

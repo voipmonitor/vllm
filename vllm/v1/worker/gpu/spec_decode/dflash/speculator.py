@@ -99,6 +99,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self.draft_cp_size = 1
+        self.draft_cp_rank = 0
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -151,6 +153,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.attn_groups,
             self.kv_cache_config,
             self.max_model_len,
+            draft_cp_size=self.draft_cp_size,
+            draft_cp_rank=self.draft_cp_rank,
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
@@ -183,6 +187,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+        draft_cp_sizes = {
+            block_tables.group_cp_sizes[gid] for gid in self.draft_kv_cache_group_ids
+        }
+        if len(draft_cp_sizes) != 1:
+            raise ValueError(
+                "All DFlash KV cache groups must use the same DCP topology, "
+                f"got shard counts {sorted(draft_cp_sizes)}."
+            )
+        self.draft_cp_size = draft_cp_sizes.pop()
+        self.draft_cp_rank = block_tables.cp_rank % self.draft_cp_size
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -291,13 +305,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         if not self.draft_attn_layer_names:
             return None
         assert num_query_per_req is None  # Omitted for DFlash, read from self instead
-        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
+        if dcp_local_seq_lens is None and self.draft_cp_size > 1:
             prepare_dcp_local_seq_lens(
                 self.input_buffers.dcp_local_seq_lens,
                 self.input_buffers.seq_lens,
                 num_reqs,
-                self.block_tables.cp_size,
-                self.block_tables.cp_rank,
+                self.draft_cp_size,
+                self.draft_cp_rank,
                 self.block_tables.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
@@ -406,8 +420,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
-                self.block_tables.cp_rank,
-                self.block_tables.cp_size,
+                self.block_tables.cp_rank % self.block_tables.group_cp_sizes[gid],
+                self.block_tables.group_cp_sizes[gid],
                 self.block_tables.cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
