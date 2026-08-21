@@ -274,6 +274,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.connector = None
     scheduler.ec_connector = None
     scheduler.structured_output_manager = Mock()
+    filter_tokens = (
+        scheduler.structured_output_manager.filter_speculative_grammar_tokens
+    )
+    filter_tokens.side_effect = lambda request, new_token_ids: (new_token_ids, 0)
     scheduler.structured_output_manager.should_advance.return_value = True
     scheduler.structured_output_manager.trim_reasoning_for_advance.side_effect = (
         lambda request, new_token_ids: new_token_ids

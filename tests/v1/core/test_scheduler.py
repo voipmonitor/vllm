@@ -839,6 +839,67 @@ def test_stop_via_update_from_output():
     assert list(requests[0].output_token_ids) == [EOS_TOKEN_ID, 10, 11]
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("use_structured_output", [False, True])
+def test_speculative_grammar_filter_is_gated_and_rolls_back_scheduler_state(
+    async_scheduling: bool,
+    use_structured_output: bool,
+):
+    """Grammar filtering is isolated and rejected tokens remain schedulable."""
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        async_scheduling=async_scheduling,
+    )
+    request = create_requests(num_requests=1)[0]
+    if use_structured_output:
+        request.structured_output_request = Mock()
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens + 4
+    request.num_output_placeholders = 4 if async_scheduling else 0
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    manager = Mock()
+    manager.filter_speculative_grammar_tokens.return_value = ([10, 11], 2)
+    manager.should_advance.return_value = False
+    scheduler.structured_output_manager = manager
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 4},
+        total_num_scheduled_tokens=4,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10, 11, 12]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11, 12, 13]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    expected_tokens = [10, 11] if use_structured_output else [10, 11, 12, 13]
+    expected_filter_calls = 1 if use_structured_output else 0
+
+    assert request.num_computed_tokens == request.num_tokens
+    assert request.num_output_placeholders == 0
+    assert list(request.output_token_ids) == expected_tokens
+    assert outputs[0].outputs[0].new_token_ids == expected_tokens
+    assert manager.filter_speculative_grammar_tokens.call_count == expected_filter_calls
+    stats = outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats is not None
+    assert stats.num_accepted_tokens == (2 if use_structured_output else 3)
+
+
 def test_check_stop_min_tokens():
     """Test that requests don't stop when min_tokens requirement isn't met."""
     from vllm.v1.core.sched.utils import check_stop
@@ -3283,6 +3344,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.ec_connector = None
     scheduler.acceptance_length_controller = None
     scheduler.structured_output_manager = Mock()
+    filter_tokens = (
+        scheduler.structured_output_manager.filter_speculative_grammar_tokens
+    )
+    filter_tokens.side_effect = lambda request, new_token_ids: (new_token_ids, 0)
     scheduler.structured_output_manager.should_advance.return_value = True
     scheduler.structured_output_manager.trim_reasoning_for_advance.side_effect = (
         lambda request, new_token_ids: new_token_ids
