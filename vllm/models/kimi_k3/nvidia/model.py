@@ -5,7 +5,7 @@
 import math
 import os
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import regex as re
 import torch
@@ -137,6 +137,27 @@ from ..common.mm_preprocess import (
 )
 
 logger = init_logger(__name__)
+
+
+class AuxiliaryStateProjector(Protocol):
+    """Consumer that projects target auxiliary states as they are produced."""
+
+    def can_stream_auxiliary_states(
+        self,
+        layer_ids: tuple[int, ...],
+        hidden_states: torch.Tensor,
+    ) -> bool: ...
+
+    def begin_auxiliary_stream(self, hidden_states: torch.Tensor) -> None: ...
+
+    def accumulate_auxiliary_state(
+        self,
+        primary: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> None: ...
+
+    def finish_auxiliary_stream(self) -> torch.Tensor: ...
+
 
 # Token-count cutoff for overlapping the MoE router gate with the routed-expert
 # down projection on a separate CUDA stream (latent MoE). At or below this many
@@ -1836,6 +1857,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+        # A draft may bind an auxiliary-state projector after both models load.
+        # Bypass nn.Module registration because the draft is not a target child.
+        object.__setattr__(self, "_aux_hidden_state_projector", None)
+
+    def set_aux_hidden_state_projector(
+        self,
+        projector: AuxiliaryStateProjector | None,
+    ) -> None:
+        """Bind a non-owning consumer for memory-bounded auxiliary states."""
+        object.__setattr__(self, "_aux_hidden_state_projector", projector)
 
     def make_empty_intermediate_tensors(
         self,
@@ -1958,10 +1989,29 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = sp_shard(hidden_states)
             assert residual is None, "Currently, SP is not supported with PP"
 
-        # sharded aux hidden states when sp is enabled
+        projector = getattr(self, "_aux_hidden_state_projector", None)
+        pp_group = get_pp_group()
+        stream_aux_hidden_states = bool(
+            projector is not None
+            and not self.use_sequence_parallel
+            and pp_group.is_first_rank
+            and pp_group.is_last_rank
+            and projector.can_stream_auxiliary_states(
+                self.aux_hidden_state_layers, hidden_states
+            )
+        )
+        if stream_aux_hidden_states:
+            projector.begin_auxiliary_stream(hidden_states)
+
+        # Auxiliary states remain sequence-parallel shards until the final gather.
         aux_hidden_states: list[torch.Tensor] = []
         if self.start_layer in self.aux_hidden_state_layers:
-            if self.use_attn_res or residual is None:
+            if stream_aux_hidden_states:
+                projector.accumulate_auxiliary_state(
+                    hidden_states,
+                    None if self.use_attn_res else residual,
+                )
+            elif self.use_attn_res or residual is None:
                 aux_hidden_states.append(hidden_states)
             else:
                 aux_hidden_states.append(hidden_states + residual)
@@ -1996,14 +2046,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 attn_res_scratch=attn_res_scratch,
             )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
-                if self.use_attn_res:
+                if stream_aux_hidden_states and self.use_attn_res:
+                    assert prefix_sum is not None
+                    projector.accumulate_auxiliary_state(prefix_sum, hidden_states)
+                elif stream_aux_hidden_states:
+                    assert residual is not None
+                    projector.accumulate_auxiliary_state(hidden_states, residual)
+                elif self.use_attn_res:
                     assert prefix_sum is not None
                     aux_hidden_state = prefix_sum + hidden_states
+                    aux_hidden_states.append(aux_hidden_state)
                 else:
                     assert residual is not None
                     aux_hidden_state = hidden_states + residual
-
-                aux_hidden_states.append(aux_hidden_state)
+                    aux_hidden_states.append(aux_hidden_state)
 
         assert hidden_states is not None
         assert residual is not None
@@ -2034,6 +2090,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
         else:
             hidden_states = hidden_states + residual
+
+        if stream_aux_hidden_states:
+            aux_hidden_states.append(projector.finish_auxiliary_stream())
 
         if self.use_sequence_parallel:
             if aux_hidden_states:
