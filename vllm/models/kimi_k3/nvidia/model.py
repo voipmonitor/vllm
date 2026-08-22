@@ -2093,9 +2093,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         pp_group = get_pp_group()
         stream_aux_hidden_states = bool(
             projector is not None
-            # The streaming projector consumes plain residual sums. DFlash
-            # AttnRes capture requires the pre-norm mixture computed below.
-            and not self._aux_attn_res_stream
             and not self.use_sequence_parallel
             and pp_group.is_first_rank
             and pp_group.is_last_rank
@@ -2104,12 +2101,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
         )
         if stream_aux_hidden_states:
+            assert projector is not None
             projector.begin_auxiliary_stream(hidden_states)
 
         # Auxiliary states remain sequence-parallel shards until the final gather.
         aux_hidden_states: list[torch.Tensor] = []
         if self.start_layer in self.aux_hidden_state_layers:
             if stream_aux_hidden_states:
+                assert projector is not None
                 projector.accumulate_auxiliary_state(
                     hidden_states,
                     None if self.use_attn_res else residual,
@@ -2150,9 +2149,18 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if stream_aux_hidden_states and self.use_attn_res:
+                    assert projector is not None
                     assert prefix_sum is not None
-                    projector.accumulate_auxiliary_state(prefix_sum, hidden_states)
+                    assert residual is not None
+                    auxiliary_state = self._capture_aux_hidden_stream(
+                        layer_idx,
+                        prefix_sum,
+                        hidden_states,
+                        residual,
+                    )
+                    projector.accumulate_auxiliary_state(auxiliary_state, None)
                 elif stream_aux_hidden_states:
+                    assert projector is not None
                     assert residual is not None
                     projector.accumulate_auxiliary_state(hidden_states, residual)
                 elif self.use_attn_res:
@@ -2198,6 +2206,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             hidden_states = hidden_states + residual
 
         if stream_aux_hidden_states:
+            assert projector is not None
             aux_hidden_states.append(projector.finish_auxiliary_stream())
 
         if self.use_sequence_parallel:
