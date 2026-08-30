@@ -90,9 +90,8 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         output_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        aligned_embeds = inputs_embeds.masked_fill(positions.eq(0).unsqueeze(-1), 0)
         eh_input = torch.cat(
-            (self.enorm(aligned_embeds), self.hnorm(previous_hidden_states)),
+            (self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)),
             dim=-1,
         )
         hidden_states = self.eh_proj(eh_input)
