@@ -1,0 +1,67 @@
+"""Dense block-scaled GEMM for SM12x: ``C = (A·SFA) @ (B·SFB)``.
+
+One-shot functional op over the shared SM120 warp-MMA engine (no TMEM, no
+tcgen05, no 2-CTA). Recipes: NVFP4 (Float4E2M1 values, e4m3 scales, vec 16),
+MXFP4 (e8m0 scales, vec 32), MXFP8 (e4m3 values, e8m0 scales, vec 32), and
+tensor-scaled FP8. ``mm`` accepts raw ``(values, scales)`` operand pairs or a
+weight returned by ``pack_weight``. A packed MXFP8 weight accepts either a
+BF16/FP16 activation or a prequantized ``(values, scales)`` pair with compact
+row-major or F8_128x4-swizzled UE8M0 scales. Pass swizzled storage flattened
+(or as its native 6D view); a 2D ``[M,K/32]`` scale is interpreted as compact.
+``expected_m`` is a DeepGEMM-style regime hint (decode vs prefill tiles).
+
+Example:
+    from b12x.gemm import blockscaled
+
+    out = blockscaled.mm(
+        (a_fp4, a_sf), (b_fp4, b_sf),
+        ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn", sf_vec_size=16,
+        c_dtype="bfloat16", alpha=alpha, expected_m=m,
+    )
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from ..._lib.meta import OpMeta, Provenance, install_lazy_api
+
+META = OpMeta(
+    name="blockscaled",
+    group="gemm",
+    api_style="oneshot",
+    entry_points=(
+        "Weight",
+        "mm",
+        "mm_mxfp4",
+        "mm_nvfp4",
+        "mm_block_fp8",
+        "pack_weight",
+        "prewarm",
+        "is_supported",
+    ),
+    dtypes=("bf16", "fp16", "fp32", "fp8_e4m3", "fp4_e2m1"),
+    recipes=("nvfp4", "mxfp4", "mxfp8"),
+    requires=("triton",),
+    provenance=Provenance(
+        repo="https://github.com/lukealonso/b12x",
+        commit="6627d342",
+        paths=("b12x/gemm/dense.py",),
+    ),
+    test_path="tests/gemm/test_blockscaled.py",
+    since="0.7.0",
+)
+
+if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
+    from .api import (  # noqa: F401
+        Weight,
+        is_supported,
+        mm,
+        mm_block_fp8,
+        mm_mxfp4,
+        mm_nvfp4,
+        pack_weight,
+        prewarm,
+    )
+
+install_lazy_api(globals(), META)
