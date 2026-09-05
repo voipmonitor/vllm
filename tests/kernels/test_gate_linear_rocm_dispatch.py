@@ -108,7 +108,7 @@ def test_rocm_set_out_dtype_respects_bias_guard(monkeypatch):
     assert not gate.allow_cublas_router_gemm
 
 
-def test_sm120_enables_only_ll_bf16_router(monkeypatch):
+def test_sm120_enables_bf16_fp32_paths_without_datacenter_kernels(monkeypatch):
     gate = _make_gate(
         monkeypatch,
         is_rocm=False,
@@ -119,7 +119,7 @@ def test_sm120_enables_only_ll_bf16_router(monkeypatch):
     assert gate.allow_ll_bf16_gemm
     assert not gate.allow_specialized_router_gemm
     assert not gate.allow_dsv3_router_gemm
-    assert not gate.allow_cublas_router_gemm
+    assert gate.allow_cublas_router_gemm
 
 
 def test_sm120_ll_bf16_respects_bias(monkeypatch):
@@ -132,6 +132,7 @@ def test_sm120_ll_bf16_respects_bias(monkeypatch):
     )
 
     assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
 
 
 def test_sm120_force_fp32_compute_preserves_fp32_weight_contract(monkeypatch):
@@ -145,6 +146,7 @@ def test_sm120_force_fp32_compute_preserves_fp32_weight_contract(monkeypatch):
 
     assert gate.weight.dtype == torch.float32
     assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
 
 
 def test_sm120_set_out_dtype_enables_ll_bf16(monkeypatch):
@@ -157,5 +159,19 @@ def test_sm120_set_out_dtype_enables_ll_bf16(monkeypatch):
     )
 
     assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
     gate.set_out_dtype(torch.float32)
     assert gate.allow_ll_bf16_gemm
+    assert gate.allow_cublas_router_gemm
+
+
+def test_sm120_bf16_output_does_not_enable_fp32_gemm(monkeypatch):
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=False,
+        is_cuda=True,
+        device_capability=(12, 0),
+        out_dtype=torch.bfloat16,
+    )
+    assert not gate.allow_ll_bf16_gemm
+    assert not gate.allow_cublas_router_gemm
