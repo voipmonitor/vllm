@@ -575,7 +575,7 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
-        stops = (
+        stops: tuple[int, ...] = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
