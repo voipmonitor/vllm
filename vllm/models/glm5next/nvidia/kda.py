@@ -17,9 +17,47 @@ import os
 import torch
 from einops import rearrange
 
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
 )
+from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionBackend,
+    GDNAttentionMetadataBuilder,
+)
+from vllm.v1.kv_cache_interface import MambaSpec
+
+
+class Glm5NextKDAMetadataBuilder(GDNAttentionMetadataBuilder):
+    supports_varlen_decode_cudagraph = True
+
+    def __init__(
+        self,
+        kv_cache_spec: MambaSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Adaptive verification supplies packed boundaries on device, while the
+        # CPU lengths describe an even distribution of the same token budget.
+        self._reuse_spec_decode_inputs = False
+
+
+class Glm5NextKDAAttentionBackend(GDNAttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "GLM5NEXT_KDA"
+
+    @staticmethod
+    def get_builder_cls() -> type[Glm5NextKDAMetadataBuilder]:
+        return Glm5NextKDAMetadataBuilder
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        return True
+
 
 _GATE_SIDE_STREAM = os.getenv("VLLM_GLM53_KDA_GATE_SIDE_STREAM", "1") != "0"
 _side_streams: dict[int, torch.cuda.Stream] = {}
@@ -67,6 +105,15 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
 
     enable_b12x_kda_decode = True
     b12x_kda_null_state_index = 0
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.enable_adaptive_verification
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            return Glm5NextKDAAttentionBackend
+        return super().get_attn_backend()
 
     def forward(  # type: ignore[override]
         self,
