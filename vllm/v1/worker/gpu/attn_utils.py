@@ -383,11 +383,15 @@ def compute_mm_prefix_ranges(
     req_ids: list[str],
     mm_features: dict[str, list[MultiModalFeatureSpec]],
     sliding_window: int | None = None,
+    *,
+    clamp_sliding_window: bool = False,
+    span_leading_pad_modulus: int = 0,
 ) -> dict[int, list[tuple[int, int]]]:
     """Compute PrefixLM bidirectional ranges for multimodal tokens.
 
-    Ranges exceeding sliding_window are skipped to prevent early tokens
-    from attending across the entire image span.
+    Ranges exceeding sliding_window are skipped unless the attention kernel
+    clamps them. Aligned sentinel blocks include the boundary tokens and
+    exclude their leading alignment padding.
     """
     req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
     for req_idx, req_id in enumerate(req_ids):
@@ -395,8 +399,24 @@ def compute_mm_prefix_ranges(
         for mm_feature in mm_features.get(req_id, ()):
             if mm_feature.modality not in ("image", "video"):
                 continue
-            for r in mm_feature.mm_position.extract_embeds_range():
-                if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:
+            pos_info = mm_feature.mm_position
+            if span_leading_pad_modulus:
+                pad = (
+                    span_leading_pad_modulus
+                    - 1
+                    - pos_info.offset % span_leading_pad_modulus
+                )
+                ranges = [
+                    (pos_info.offset + pad, pos_info.offset + pos_info.length - 1)
+                ]
+            else:
+                ranges = pos_info.extract_embeds_range()
+            for r in ranges:
+                if (
+                    not clamp_sliding_window
+                    and sliding_window is not None
+                    and (r[1] - r[0] + 1) > sliding_window
+                ):
                     continue
                 image_doc_ranges.append(r)
         req_doc_ranges[req_idx] = image_doc_ranges

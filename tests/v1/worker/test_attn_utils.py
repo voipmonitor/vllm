@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
@@ -27,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
+    compute_mm_prefix_ranges,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
     synchronize_attention_impl_kv_cache_layout,
@@ -36,6 +38,42 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
 )
+
+
+@pytest.mark.parametrize("offset", range(4))
+def test_mm_prefix_ranges_include_aligned_image_sentinels(offset):
+    is_embed = torch.zeros(384, dtype=torch.bool)
+    is_embed[8:-8] = True
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(offset=offset, length=384, is_embed=is_embed),
+    )
+    features = {"request": [feature]}
+
+    assert compute_mm_prefix_ranges(["request"], features, sliding_window=128) == {
+        0: []
+    }
+    assert compute_mm_prefix_ranges(
+        ["request"],
+        features,
+        sliding_window=128,
+        clamp_sliding_window=True,
+        span_leading_pad_modulus=4,
+    ) == {0: [(3, offset + 383)]}
+
+
+def test_mm_prefix_ranges_preserve_unaligned_embed_ranges():
+    feature = MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(offset=7, length=32),
+    )
+    assert compute_mm_prefix_ranges(
+        ["request"], {"request": [feature]}, sliding_window=128
+    ) == {0: [(7, 38)]}
 
 
 class _FakeMetadataBuilder:
