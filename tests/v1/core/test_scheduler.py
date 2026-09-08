@@ -146,8 +146,26 @@ def test_pending_boundary_import_defers_without_blocking_another_request():
 
 
 @pytest.mark.parametrize("admission_blocker", [None, "capacity", "allocation", "pause"])
+@pytest.mark.parametrize(
+    "fairness_options",
+    [
+        {},
+        {"prefill_compute_share": 0.4},
+        {"prefill_compute_share": "auto"},
+        {
+            "prefill_compute_share": 0.4,
+            "max_parallel_prefills": 4,
+            "prefill_policy": "round-robin",
+        },
+        {
+            "prefill_compute_share": "auto",
+            "max_parallel_prefills": 4,
+            "prefill_policy": "decode-aware",
+        },
+    ],
+)
 def test_full_boundary_hit_is_admitted_while_another_request_decodes(
-    admission_blocker, monkeypatch
+    admission_blocker, fairness_options, monkeypatch
 ):
     """A saved-logits hit needs one isolated step, not an empty running queue."""
     scheduler = create_scheduler(
@@ -156,6 +174,7 @@ def test_full_boundary_hit_is_admitted_while_another_request_decodes(
         async_scheduling=True,
         num_speculative_tokens=3,
         speculative_method="ngram_gpu",
+        **fairness_options,
     )
     manager = scheduler.kv_cache_manager
     manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
