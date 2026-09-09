@@ -237,9 +237,9 @@ def test_actual_scheduler_runs_decode_after_guard_defers_restore(fairness):
         async_scheduling=True,
         num_speculative_tokens=3,
         speculative_method="ngram_gpu",
-        fairness_engine="compute_share" if fairness is not None else None,
         prefill_compute_share=fairness,
     )
+    assert (scheduler.compute_share_controller is not None) == (fairness is not None)
     cache = scheduler.kv_cache_manager
     cache.boundary_checkpoints = BoundaryCheckpointCache(cache.block_pool)
     producer, first, second = create_requests(
